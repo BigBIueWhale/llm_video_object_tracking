@@ -437,7 +437,6 @@ def run_llm_for_frame(
 
         params = ChatCompleteParams(
             messages=messages,
-            role="highest_quality",
             model=model_name,
             client=client,
             connection=connection,

@@ -13,7 +13,6 @@ from core.tokens import count_tokens
 
 # --- Type aliases ---
 
-RoleName: TypeAlias = Literal["judge", "splitter", "highest_quality"]
 ModelName: TypeAlias = Literal["qwen3-vl:32b-instruct", "qwen3-vl:32b-thinking"]
 MessageRole: TypeAlias = Literal["system", "user", "assistant"]
 NumericOption = int | float
@@ -272,7 +271,6 @@ class ChatCompleteParams:
     configuration object.
     """
     messages: list[ChatMessage]
-    role: RoleName   # Retained for compatibility with existing callers/logging.
     model: ModelName
     client: httpx.Client
     connection: OllamaConnectionConfig

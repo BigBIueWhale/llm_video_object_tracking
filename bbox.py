@@ -6,6 +6,7 @@ import json
 import math
 import os
 import sys
+import subprocess
 from dataclasses import dataclass
 from typing import List
 
@@ -46,6 +47,381 @@ class NormalizedBBox:
     y1: int
     x2: int
     y2: int
+
+
+def probe_video_metadata(path: str) -> tuple[int, int, float, int]:
+    """
+    Inspect the input video using ffprobe and return (width, height, fps, total_frames).
+
+    Any structural issues or missing fields are treated as fatal.
+    """
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height,avg_frame_rate,nb_frames",
+        "-of",
+        "json",
+        path,
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "ffprobe executable not found. Ensure FFmpeg (including ffprobe) is installed "
+            "and available on PATH."
+        ) from exc
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "ffprobe failed to inspect the input video.\n"
+            f"Command: {' '.join(cmd)}\n"
+            f"Exit code: {result.returncode}\n"
+            f"Stderr:\n{result.stderr}"
+        )
+
+    try:
+        info = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "ffprobe returned non-JSON output when JSON was requested.\n"
+            f"Raw stdout (first 1000 chars): {result.stdout[:1000]!r}"
+        ) from exc
+
+    streams = info.get("streams")
+    if not streams:
+        raise RuntimeError(
+            "ffprobe did not return any video streams for the input file.\n"
+            f"Command: {' '.join(cmd)}"
+        )
+
+    stream = streams[0]
+
+    width = int(stream.get("width") or 0)
+    height = int(stream.get("height") or 0)
+    if width <= 0 or height <= 0:
+        raise RuntimeError(
+            "ffprobe reported non-positive width/height for the input video.\n"
+            f"Reported width={width}, height={height}."
+        )
+
+    avg_frame_rate = stream.get("avg_frame_rate") or "0/0"
+    fps = 0.0
+    if isinstance(avg_frame_rate, str) and "/" in avg_frame_rate:
+        num_str, den_str = avg_frame_rate.split("/", 1)
+        try:
+            num = float(num_str)
+            den = float(den_str)
+            if den != 0:
+                fps = num / den
+        except ValueError:
+            fps = 0.0
+    else:
+        try:
+            fps = float(avg_frame_rate)
+        except (TypeError, ValueError):
+            fps = 0.0
+
+    nb_frames_raw = stream.get("nb_frames")
+    total_frames = 0
+    if isinstance(nb_frames_raw, str) and nb_frames_raw.isdigit():
+        total_frames = int(nb_frames_raw)
+
+    return width, height, fps, total_frames
+
+
+class FFmpegDecodeStream:
+    """
+    Thin wrapper around an ffmpeg CLI process that decodes a video file into raw BGR frames.
+    """
+
+    def __init__(
+        self,
+        input_path: str,
+        width: int,
+        height: int,
+        max_frames: int | None = None,
+    ) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError(
+                f"FFmpegDecodeStream requires positive width/height, got {width}x{height}."
+            )
+
+        self.input_path = input_path
+        self.width = width
+        self.height = height
+        self.frame_size_bytes = width * height * 3
+        self._closed = False
+
+        cmd: list[str] = [
+            "ffmpeg",
+            "-v",
+            "info",
+            "-i",
+            input_path,
+        ]
+        if max_frames is not None:
+            if max_frames <= 0:
+                raise ValueError(
+                    f"FFmpegDecodeStream max_frames must be positive when provided, got {max_frames}."
+                )
+            cmd += ["-vframes", str(max_frames)]
+        cmd += [
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-",
+        ]
+        self.cmd = cmd
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=None,  # Inherit stderr so ffmpeg logs are visible in real time.
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "Failed to start ffmpeg for decoding input video: executable not found. "
+                "Ensure 'ffmpeg' is installed and available on PATH."
+            ) from exc
+
+        if proc.stdout is None:
+            raise RuntimeError(
+                "Internal error: ffmpeg decode process was started without a stdout pipe."
+            )
+
+        self.proc = proc
+        self.stdout = proc.stdout
+
+    def _read_exact(self, n: int) -> bytes | None:
+        """
+        Read exactly n bytes from ffmpeg's stdout, or return None if EOF is reached
+        before any bytes are read.
+        """
+        chunks: list[bytes] = []
+        bytes_read = 0
+
+        while bytes_read < n:
+            chunk = self.stdout.read(n - bytes_read)
+            if not chunk:
+                if bytes_read == 0:
+                    return None
+                raise RuntimeError(
+                    "ffmpeg decode process ended before a full frame could be read.\n"
+                    f"Expected {n} bytes, got {bytes_read} bytes.\n"
+                    f"Command: {' '.join(self.cmd)}"
+                )
+            chunks.append(chunk)
+            bytes_read += len(chunk)
+
+        return b"".join(chunks)
+
+    def read_frame(self) -> np.ndarray | None:
+        """
+        Read a single frame as a uint8 BGR numpy array with shape (height, width, 3).
+
+        Returns None on clean EOF.
+        """
+        if self._closed:
+            return None
+
+        buf = self._read_exact(self.frame_size_bytes)
+        if buf is None:
+            return None
+
+        frame = np.frombuffer(buf, dtype=np.uint8)
+        try:
+            frame = frame.reshape((self.height, self.width, 3))
+        except ValueError as exc:
+            raise RuntimeError(
+                "Decoded raw frame from ffmpeg has unexpected size when reshaping.\n"
+                f"Expected {self.height}x{self.width}x3 bytes."
+            ) from exc
+        return frame
+
+    def _wait(self, expect_zero_exit: bool) -> None:
+        if self._closed:
+            return
+        ret = self.proc.wait()
+        self._closed = True
+        if expect_zero_exit and ret != 0:
+            raise RuntimeError(
+                "ffmpeg decode process exited with a non-zero status.\n"
+                f"Command: {' '.join(self.cmd)}\n"
+                f"Exit code: {ret}"
+            )
+
+    def close(self, expect_zero_exit: bool = True) -> None:
+        if self._closed:
+            return
+        try:
+            if self.stdout and not self.stdout.closed:
+                self.stdout.close()
+        finally:
+            self._wait(expect_zero_exit=expect_zero_exit)
+
+    def terminate(self) -> None:
+        if self._closed:
+            return
+        try:
+            self.proc.terminate()
+        finally:
+            try:
+                if self.stdout and not self.stdout.closed:
+                    self.stdout.close()
+            finally:
+                # We explicitly do not enforce a zero exit code when terminating.
+                self._wait(expect_zero_exit=False)
+
+
+class FFmpegEncodeStream:
+    """
+    Thin wrapper around an ffmpeg CLI process that encodes raw BGR frames into MP4.
+    """
+
+    def __init__(
+        self,
+        output_path: str,
+        width: int,
+        height: int,
+        fps: float,
+    ) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError(
+                f"FFmpegEncodeStream requires positive width/height, got {width}x{height}."
+            )
+        if fps <= 0:
+            raise ValueError(
+                f"FFmpegEncodeStream requires a positive fps value, got {fps!r}."
+            )
+
+        self.output_path = output_path
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self._closed = False
+
+        cmd: list[str] = [
+            "ffmpeg",
+            "-v",
+            "info",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            f"{fps}",
+            "-i",
+            "-",
+            "-y",
+            "-an",
+            # Opinionated choice: always encode as MP4 using MPEG-4 Part 2 ('mp4v')
+            # rather than guessing based on the input codec.
+            "-c:v",
+            "mpeg4",
+            output_path,
+        ]
+        self.cmd = cmd
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stderr=None,  # Inherit stderr so ffmpeg logs are visible in real time.
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "Failed to start ffmpeg for encoding output video: executable not found. "
+                "Ensure 'ffmpeg' is installed and available on PATH."
+            ) from exc
+
+        if proc.stdin is None:
+            raise RuntimeError(
+                "Internal error: ffmpeg encode process was started without a stdin pipe."
+            )
+
+        self.proc = proc
+        self.stdin = proc.stdin
+
+    def write_frame(self, frame_bgr: np.ndarray) -> None:
+        """
+        Encode a single uint8 BGR frame with shape (height, width, 3).
+        """
+        if self._closed:
+            raise RuntimeError(
+                "Attempted to write a frame to a closed ffmpeg encode stream."
+            )
+
+        h, w = frame_bgr.shape[:2]
+        if (w, h) != (self.width, self.height):
+            raise RuntimeError(
+                "Attempted to encode a frame with unexpected resolution.\n"
+                f"Expected {self.width}x{self.height}, got {w}x{h}."
+            )
+
+        if frame_bgr.dtype != np.uint8 or frame_bgr.ndim != 3 or frame_bgr.shape[2] != 3:
+            raise RuntimeError(
+                "Frames passed to FFmpegEncodeStream.write_frame must be uint8 BGR images "
+                "with shape (height, width, 3)."
+            )
+
+        try:
+            self.stdin.write(frame_bgr.tobytes())
+        except BrokenPipeError as exc:
+            raise RuntimeError(
+                "ffmpeg encode process closed its input pipe unexpectedly while writing a frame.\n"
+                f"Command: {' '.join(self.cmd)}"
+            ) from exc
+
+    def _wait(self, expect_zero_exit: bool) -> None:
+        if self._closed:
+            return
+        ret = self.proc.wait()
+        self._closed = True
+        if expect_zero_exit and ret != 0:
+            raise RuntimeError(
+                "ffmpeg encode process exited with a non-zero status.\n"
+                f"Command: {' '.join(self.cmd)}\n"
+                f"Exit code: {ret}\n"
+                "This likely means your ffmpeg build does not provide an encoder for the "
+                "explicitly requested 'mpeg4' codec (FourCC 'mp4v'), or the output file "
+                "could not be written."
+            )
+
+    def close(self, expect_zero_exit: bool = True) -> None:
+        if self._closed:
+            return
+        try:
+            if self.stdin and not self.stdin.closed:
+                self.stdin.close()
+        finally:
+            self._wait(expect_zero_exit=expect_zero_exit)
+
+    def terminate(self) -> None:
+        if self._closed:
+            return
+        try:
+            try:
+                if self.stdin and not self.stdin.closed:
+                    self.stdin.close()
+            finally:
+                self.proc.terminate()
+        finally:
+            # We explicitly do not enforce a zero exit code when terminating.
+            self._wait(expect_zero_exit=False)
 
 
 def parse_args() -> argparse.Namespace:
@@ -741,14 +1117,7 @@ def process_video(description: str, allowed_labels: List[str]) -> None:
             f"Expected input video at {INPUT_VIDEO_PATH!r}, but it does not exist."
         )
 
-    cap = cv2.VideoCapture(INPUT_VIDEO_PATH)
-    if not cap.isOpened():
-        raise RuntimeError(f"Failed to open input video: {INPUT_VIDEO_PATH}")
-
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-    orig_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    orig_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    orig_width, orig_height, fps, total_frames = probe_video_metadata(INPUT_VIDEO_PATH)
 
     print(
         f"[video] Loaded {INPUT_VIDEO_PATH}\n"
@@ -765,7 +1134,6 @@ def process_video(description: str, allowed_labels: List[str]) -> None:
     connection = OllamaConnectionConfig(base_url="http://172.17.0.1:11434")
     client = get_client(connection)
 
-    out = None
     try:
         frames_already_done = 0
         if os.path.exists(FRAMES_JSONL_PATH):
@@ -786,8 +1154,8 @@ def process_video(description: str, allowed_labels: List[str]) -> None:
         if total_frames > 0 and frames_already_done > total_frames:
             raise RuntimeError(
                 "Existing JSONL file appears to contain more frames than the input video reports.\n"
-                f"  - video frames (CAP_PROP_FRAME_COUNT): {total_frames}\n"
-                f"  - JSONL frames:                         {frames_already_done}\n"
+                f"  - video frames (ffprobe nb_frames): {total_frames}\n"
+                f"  - JSONL frames:                     {frames_already_done}\n"
                 "This script refuses to guess how to reconcile this mismatch. "
                 "Delete the JSONL file and re-run, or investigate the inconsistency."
             )
@@ -795,61 +1163,70 @@ def process_video(description: str, allowed_labels: List[str]) -> None:
         # Stage 1: run the LLM for all frames that do not yet have JSONL entries.
         frame_index = 0
         jsonl_mode = "a" if frames_already_done > 0 else "w"
-        with open(FRAMES_JSONL_PATH, jsonl_mode, encoding="utf-8") as jsonl_file:
-            try:
-                while True:
-                    ret, frame_bgr = cap.read()
-                    if not ret:
-                        break  # End of video; do not rely solely on frame_count.
+        decode_stream = FFmpegDecodeStream(
+            INPUT_VIDEO_PATH,
+            orig_width,
+            orig_height,
+            max_frames=None,
+        )
+        try:
+            with open(FRAMES_JSONL_PATH, jsonl_mode, encoding="utf-8") as jsonl_file:
+                try:
+                    while True:
+                        frame_bgr = decode_stream.read_frame()
+                        if frame_bgr is None:
+                            break  # End of video.
+                        h, w = frame_bgr.shape[:2]
+                        if (w, h) != (orig_width, orig_height):
+                            raise RuntimeError(
+                                "Encountered a frame with different resolution within the same video. "
+                                f"Expected {orig_width}x{orig_height}, got {w}x{h} at frame {frame_index}."
+                            )
 
-                    h, w = frame_bgr.shape[:2]
-                    if (w, h) != (orig_width, orig_height):
-                        raise RuntimeError(
-                            "Encountered a frame with different resolution within the same video. "
-                            f"Expected {orig_width}x{orig_height}, got {w}x{h} at frame {frame_index}."
+                        if frame_index < frames_already_done:
+                            # This frame was already processed in a previous run; skip LLM.
+                            frame_index += 1
+                            continue
+
+                        boxes = run_llm_for_frame(
+                            frame_bgr=frame_bgr,
+                            description=description,
+                            allowed_labels=allowed_labels,
+                            frame_index=frame_index,
+                            total_frames=total_frames if total_frames > 0 else frame_index + 1,
+                            client=client,
+                            connection=connection,
+                            resized_w=resized_w,
+                            resized_h=resized_h,
                         )
 
-                    if frame_index < frames_already_done:
-                        # This frame was already processed in a previous run; skip LLM.
+                        record = {
+                            "frame_index": frame_index,
+                            "boxes": [
+                                {
+                                    "label": box.label,
+                                    "x1": box.x1,
+                                    "y1": box.y1,
+                                    "x2": box.x2,
+                                    "y2": box.y2,
+                                }
+                                for box in boxes
+                            ],
+                        }
+                        jsonl_file.write(json.dumps(record, separators=(",", ":")) + "\n")
+                        jsonl_file.flush()
+
                         frame_index += 1
-                        continue
-
-                    boxes = run_llm_for_frame(
-                        frame_bgr=frame_bgr,
-                        description=description,
-                        allowed_labels=allowed_labels,
-                        frame_index=frame_index,
-                        total_frames=total_frames if total_frames > 0 else frame_index + 1,
-                        client=client,
-                        connection=connection,
-                        resized_w=resized_w,
-                        resized_h=resized_h,
+                except KeyboardInterrupt:
+                    print(
+                        "\n[interrupt] Caught CTRL+C. Partial JSONL results have been preserved "
+                        f"in {FRAMES_JSONL_PATH!r} and will be used for resuming.",
+                        flush=True,
                     )
-
-                    record = {
-                        "frame_index": frame_index,
-                        "boxes": [
-                            {
-                                "label": box.label,
-                                "x1": box.x1,
-                                "y1": box.y1,
-                                "x2": box.x2,
-                                "y2": box.y2,
-                            }
-                            for box in boxes
-                        ],
-                    }
-                    jsonl_file.write(json.dumps(record, separators=(",", ":")) + "\n")
-                    jsonl_file.flush()
-
-                    frame_index += 1
-            except KeyboardInterrupt:
-                print(
-                    "\n[interrupt] Caught CTRL+C. Partial JSONL results have been preserved "
-                    f"in {FRAMES_JSONL_PATH!r} and will be used for resuming.",
-                    flush=True,
-                )
-                raise SystemExit(130)
+                    decode_stream.terminate()
+                    raise SystemExit(130)
+        finally:
+            decode_stream.close(expect_zero_exit=True)
 
         actual_frames_seen = frame_index
 
@@ -861,88 +1238,77 @@ def process_video(description: str, allowed_labels: List[str]) -> None:
             raise RuntimeError(
                 "Internal inconsistency between video frames and JSONL entries after processing.\n"
                 f"  - frames seen while reading video in Stage 1: {actual_frames_seen}\n"
-                f"  - valid JSONL entries:                        {final_jsonl_frame_count}\n"
+                f"  - valid JSONL entries:                       {final_jsonl_frame_count}\n"
                 "The script refuses to proceed with rendering an inconsistent state."
             )
 
         # Stage 2: now that the JSONL file has a clean entry for every frame, build the video.
-        cap.release()
-        cap = cv2.VideoCapture(INPUT_VIDEO_PATH)
-        if not cap.isOpened():
-            raise RuntimeError(
-                f"Failed to re-open input video for rendering: {INPUT_VIDEO_PATH}"
-            )
-
         os.makedirs(os.path.dirname(OUTPUT_VIDEO_PATH), exist_ok=True)
 
-        # Opinionated choice: always encode as MP4 using MPEG-4 Part 2 ('mp4v'),
-        # instead of guessing based on the input codec. If your OpenCV/FFmpeg build
-        # cannot encode 'mp4v', we fail loudly instead of silently falling back.
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         fps_out = fps if fps > 0 else 25.0
 
-        out = cv2.VideoWriter(
+        decode_stream2 = FFmpegDecodeStream(
+            INPUT_VIDEO_PATH,
+            orig_width,
+            orig_height,
+            max_frames=final_jsonl_frame_count,
+        )
+        encode_stream = FFmpegEncodeStream(
             OUTPUT_VIDEO_PATH,
-            fourcc,
+            orig_width,
+            orig_height,
             fps_out,
-            (orig_width, orig_height),
         )
-        if not out.isOpened():
-            raise RuntimeError(
-                "Failed to open output video for writing.\n"
-                "Reason: your OpenCV/FFmpeg build does not provide an encoder for the "
-                "explicitly requested 'mp4v' codec.\n"
-                "This script refuses to guess or fall back to other codecs. "
-                "Install/rebuild FFmpeg/OpenCV with an MP4 encoder (e.g. libx264/mp4v) "
-                "or change the hard-coded codec in bbox.py."
+
+        try:
+            frame_index = 0
+            with open(FRAMES_JSONL_PATH, "r", encoding="utf-8") as jsonl_file:
+                for line_number, raw_line in enumerate(jsonl_file, start=1):
+                    line = raw_line.strip()
+                    if not line:
+                        raise ValueError(
+                            f"JSONL file {FRAMES_JSONL_PATH!r} contains an empty line at "
+                            f"line {line_number} while rendering."
+                        )
+
+                    boxes = parse_jsonl_line_to_bboxes(
+                        line=line,
+                        line_number=line_number,
+                        expected_frame_index=frame_index,
+                        allowed_labels=allowed_labels,
+                    )
+
+                    frame_bgr = decode_stream2.read_frame()
+                    if frame_bgr is None:
+                        raise RuntimeError(
+                            "Input video ended earlier than expected while building the output video.\n"
+                            f"Expected at least {final_jsonl_frame_count} frames, but "
+                            f"ffmpeg decode stream returned EOF at frame index {frame_index}."
+                        )
+
+                    h, w = frame_bgr.shape[:2]
+                    if (w, h) != (orig_width, orig_height):
+                        raise RuntimeError(
+                            "Encountered a frame with different resolution while rendering. "
+                            f"Expected {orig_width}x{orig_height}, got {w}x{h} at frame {frame_index}."
+                        )
+
+                    draw_bboxes_on_frame(frame_bgr, boxes)
+                    encode_stream.write_frame(frame_bgr)
+
+                    frame_index += 1
+
+            print(
+                f"[done] Processed {frame_index} frame(s). "
+                f"Annotated video written to {OUTPUT_VIDEO_PATH!r}.",
+                flush=True,
             )
-
-        frame_index = 0
-        with open(FRAMES_JSONL_PATH, "r", encoding="utf-8") as jsonl_file:
-            for line_number, raw_line in enumerate(jsonl_file, start=1):
-                line = raw_line.strip()
-                if not line:
-                    raise ValueError(
-                        f"JSONL file {FRAMES_JSONL_PATH!r} contains an empty line at "
-                        f"line {line_number} while rendering."
-                    )
-
-                boxes = parse_jsonl_line_to_bboxes(
-                    line=line,
-                    line_number=line_number,
-                    expected_frame_index=frame_index,
-                    allowed_labels=allowed_labels,
-                )
-
-                ret, frame_bgr = cap.read()
-                if not ret:
-                    raise RuntimeError(
-                        "Input video ended earlier than expected while building the output video.\n"
-                        f"Expected at least {final_jsonl_frame_count} frames, but "
-                        f"cv2.VideoCapture returned EOF at frame index {frame_index}."
-                    )
-
-                h, w = frame_bgr.shape[:2]
-                if (w, h) != (orig_width, orig_height):
-                    raise RuntimeError(
-                        "Encountered a frame with different resolution while rendering. "
-                        f"Expected {orig_width}x{orig_height}, got {w}x{h} at frame {frame_index}."
-                    )
-
-                draw_bboxes_on_frame(frame_bgr, boxes)
-                out.write(frame_bgr)
-
-                frame_index += 1
-
-        print(
-            f"[done] Processed {frame_index} frame(s). "
-            f"Annotated video written to {OUTPUT_VIDEO_PATH!r}.",
-            flush=True,
-        )
+        finally:
+            # In the happy path this enforces zero exit codes; in exceptional paths it may
+            # raise additional errors which are acceptable since we are already failing loudly.
+            decode_stream2.close(expect_zero_exit=True)
+            encode_stream.close(expect_zero_exit=True)
     finally:
-        cap.release()
-        if out is not None:
-            out.release()
         client.close()
 
 

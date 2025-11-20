@@ -49,9 +49,9 @@ class NormalizedBBox:
     y2: int
 
 
-def probe_video_metadata(path: str) -> tuple[int, int, float, int]:
+def probe_video_metadata(path: str) -> tuple[int, int, float, float]:
     """
-    Inspect the input video using ffprobe and return (width, height, fps, total_frames).
+    Inspect the input video using ffprobe and return (width, height, fps, duration_seconds).
 
     Any structural issues or missing fields are treated as fatal.
     """
@@ -62,7 +62,7 @@ def probe_video_metadata(path: str) -> tuple[int, int, float, int]:
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=width,height,avg_frame_rate,nb_frames",
+        "stream=width,height,avg_frame_rate,duration:format=duration",
         "-of",
         "json",
         path,
@@ -131,12 +131,20 @@ def probe_video_metadata(path: str) -> tuple[int, int, float, int]:
         except (TypeError, ValueError):
             fps = 0.0
 
-    nb_frames_raw = stream.get("nb_frames")
-    total_frames = 0
-    if isinstance(nb_frames_raw, str) and nb_frames_raw.isdigit():
-        total_frames = int(nb_frames_raw)
+    # Prefer stream-level duration, but fall back to format-level if needed.
+    duration = 0.0
+    duration_raw = stream.get("duration")
+    if duration_raw is None:
+        fmt = info.get("format")
+        if isinstance(fmt, dict):
+            duration_raw = fmt.get("duration")
+    if duration_raw is not None:
+        try:
+            duration = float(duration_raw)
+        except (TypeError, ValueError):
+            duration = 0.0
 
-    return width, height, fps, total_frames
+    return width, height, fps, duration
 
 
 class FFmpegDecodeStream:
@@ -874,7 +882,8 @@ def run_llm_for_frame(
     description: str,
     allowed_labels: List[str],
     frame_index: int,
-    total_frames: int,
+    fps: float,
+    duration: float,
     client,
     connection: OllamaConnectionConfig,
     resized_w: int,
@@ -885,9 +894,31 @@ def run_llm_for_frame(
 
     The loop has *no* fallback other than asking the LLM again; any malformed
     output leads to another attempt, with the error printed for visibility.
+
+    Progress reporting is based on timestamps derived from fps/duration rather than
+    total frame counts, so we never rely on nb_frames metadata.
     """
     attempt = 0
     model_name = "qwen3-vl:32b-thinking"
+
+    def _progress_prefix() -> str:
+        """
+        Build a human-friendly progress prefix using time-based information.
+        """
+        display_frame = frame_index + 1
+        if fps > 0.0:
+            current_time_s = frame_index / fps
+            if duration > 0.0:
+                progress = min(1.0, current_time_s / duration)
+                return (
+                    f"[frame {display_frame}]"
+                    f"[t={current_time_s:.2f}s/{duration:.2f}s "
+                    f"({progress * 100.0:5.1f}%)]"
+                )
+            else:
+                return f"[frame {display_frame}][t={current_time_s:.2f}s]"
+        else:
+            return f"[frame {display_frame}]"
 
     while True:
         attempt += 1
@@ -910,21 +941,20 @@ def run_llm_for_frame(
         except Exception as exc:
             # Non-LLM issues (network, Ollama down) are fatal; we don't silently loop them.
             raise RuntimeError(
-                f"Ollama / Qwen3-VL call failed on frame {frame_index + 1}/{total_frames}, "
+                f"Ollama / Qwen3-VL call failed on frame {frame_index + 1}, "
                 f"attempt {attempt}: {exc}"
             ) from exc
 
         stats = print_stats(response)
+        prefix = f"{_progress_prefix()}[attempt {attempt}]"
         if stats is not None:
             print(
-                f"[frame {frame_index + 1}/{total_frames}][attempt {attempt}] "
-                f"LLM stats:\n{stats}",
+                f"{prefix} LLM stats:\n{stats}",
                 flush=True,
             )
         else:
             print(
-                f"[frame {frame_index + 1}/{total_frames}][attempt {attempt}] "
-                "LLM did not return detailed token-level stats.",
+                f"{prefix} LLM did not return detailed token-level stats.",
                 flush=True,
             )
 
@@ -938,8 +968,7 @@ def run_llm_for_frame(
             if len(preview) > 400:
                 preview = preview[:400] + "...[truncated]"
             print(
-                f"[frame {frame_index + 1}/{total_frames}][attempt {attempt}] "
-                f"LLM output invalid, will retry:\n"
+                f"{prefix} LLM output invalid, will retry:\n"
                 f"  error: {exc}\n"
                 f"  raw (sanitized) preview: {preview}",
                 flush=True,
@@ -947,8 +976,7 @@ def run_llm_for_frame(
             continue
 
         print(
-            f"[frame {frame_index + 1}/{total_frames}][attempt {attempt}] "
-            f"Successfully parsed {len(boxes)} bounding box(es).",
+            f"{prefix} Successfully parsed {len(boxes)} bounding box(es).",
             flush=True,
         )
         return boxes
@@ -1117,13 +1145,14 @@ def process_video(description: str, allowed_labels: List[str]) -> None:
             f"Expected input video at {INPUT_VIDEO_PATH!r}, but it does not exist."
         )
 
-    orig_width, orig_height, fps, total_frames = probe_video_metadata(INPUT_VIDEO_PATH)
+    orig_width, orig_height, fps, duration = probe_video_metadata(INPUT_VIDEO_PATH)
 
+    duration_str = f"{duration:.3f} sec" if duration > 0.0 else "unknown"
     print(
         f"[video] Loaded {INPUT_VIDEO_PATH}\n"
         f"        resolution: {orig_width}x{orig_height}\n"
         f"        fps:        {fps:.3f}\n"
-        f"        frames:     {total_frames}",
+        f"        duration:   {duration_str}",
         flush=True,
     )
 
@@ -1150,15 +1179,6 @@ def process_video(description: str, allowed_labels: List[str]) -> None:
             )
         else:
             os.makedirs(os.path.dirname(FRAMES_JSONL_PATH), exist_ok=True)
-
-        if total_frames > 0 and frames_already_done > total_frames:
-            raise RuntimeError(
-                "Existing JSONL file appears to contain more frames than the input video reports.\n"
-                f"  - video frames (ffprobe nb_frames): {total_frames}\n"
-                f"  - JSONL frames:                     {frames_already_done}\n"
-                "This script refuses to guess how to reconcile this mismatch. "
-                "Delete the JSONL file and re-run, or investigate the inconsistency."
-            )
 
         # Stage 1: run the LLM for all frames that do not yet have JSONL entries.
         frame_index = 0
@@ -1193,7 +1213,8 @@ def process_video(description: str, allowed_labels: List[str]) -> None:
                             description=description,
                             allowed_labels=allowed_labels,
                             frame_index=frame_index,
-                            total_frames=total_frames if total_frames > 0 else frame_index + 1,
+                            fps=fps,
+                            duration=duration,
                             client=client,
                             connection=connection,
                             resized_w=resized_w,

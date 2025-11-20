@@ -51,7 +51,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Offline object tracking with Qwen3-VL-32B-Thinking on ./workspace/input.mp4.\n"
-            "The only configurable input is --description, which describes the objects to track."
+            "Configurable inputs are: --description (what to look for) and "
+            "--label/--labels (the finite set of labels the model must choose from)."
         )
     )
     parser.add_argument(
@@ -63,8 +64,46 @@ def parse_args() -> argparse.Namespace:
             "'all cars and pedestrians wearing red jackets'."
         ),
     )
-    # No other CLI arguments are supported by design.
-    return parser.parse_args()
+
+    label_group = parser.add_mutually_exclusive_group(required=True)
+    label_group.add_argument(
+        "--label",
+        dest="label",
+        action="append",
+        help=(
+            "Allowed object label. Can be specified multiple times. "
+            "Each detected object must choose exactly one label from the allowed set."
+        ),
+    )
+    label_group.add_argument(
+        "--labels",
+        dest="labels",
+        help=(
+            "Comma-separated list of allowed object labels. "
+            "Each detected object must choose exactly one label from this list."
+        ),
+    )
+
+    # No other CLI arguments are supported beyond --description and the labeling options, by design.
+    args = parser.parse_args()
+
+    # Normalize the labels into a single canonical list for downstream code.
+    allowed_labels: List[str]
+    if args.label:
+        allowed_labels = [lbl.strip() for lbl in args.label if lbl and lbl.strip()]
+    else:
+        parts = (args.labels or "").split(",")
+        allowed_labels = [part.strip() for part in parts if part.strip()]
+
+    if not allowed_labels:
+        parser.error(
+            "At least one non-empty label must be provided via --label or --labels."
+        )
+
+    # Attach normalized labels to the args namespace.
+    args.allowed_labels = allowed_labels
+
+    return args
 
 
 def lawyerly_video_checks(width: int, height: int) -> None:
@@ -213,7 +252,10 @@ def extract_json_substring(raw: str) -> str:
     return candidate
 
 
-def parse_bboxes_from_text(text: str) -> List[NormalizedBBox]:
+def parse_bboxes_from_text(
+    text: str,
+    allowed_labels: List[str] | None = None,
+) -> List[NormalizedBBox]:
     """
     Parse and validate the model output into a list of NormalizedBBox instances.
 
@@ -224,6 +266,7 @@ def parse_bboxes_from_text(text: str) -> List[NormalizedBBox]:
         - 'label' (preferred) or 'category'/'text' : non-empty string
     - Each coordinate must be a finite number in [0, 999].
     - Coordinates are coerced to ints; must satisfy x1 < x2 and y1 < y2.
+    - If allowed_labels is provided, each 'label' must match (case-insensitive) one of them.
     """
     try:
         json_payload = extract_json_substring(text)
@@ -243,6 +286,16 @@ def parse_bboxes_from_text(text: str) -> List[NormalizedBBox]:
         raise ValueError(f"Top-level JSON must be a list, got {type(data).__name__}.")
 
     boxes: List[NormalizedBBox] = []
+
+    canonical_label_map: dict[str, str] | None = None
+    if allowed_labels is not None:
+        canonical_label_map = {
+            lbl.strip().lower(): lbl.strip()
+            for lbl in allowed_labels
+            if lbl and lbl.strip()
+        }
+        if not canonical_label_map:
+            raise ValueError("allowed_labels must contain at least one non-empty label.")
 
     for idx, item in enumerate(data):
         if not isinstance(item, dict):
@@ -288,15 +341,26 @@ def parse_bboxes_from_text(text: str) -> List[NormalizedBBox]:
                 f"[{x1_i}, {y1_i}, {x2_i}, {y2_i}]"
             )
 
-        label = item.get("label") or item.get("category") or item.get("text")
-        if not isinstance(label, str) or not label.strip():
+        raw_label = item.get("label") or item.get("category") or item.get("text")
+        if not isinstance(raw_label, str) or not raw_label.strip():
             raise ValueError(
                 f"Entry {idx} missing a non-empty 'label'/'category'/'text' field."
             )
 
+        label = raw_label.strip()
+        if canonical_label_map is not None:
+            key = label.lower()
+            if key not in canonical_label_map:
+                raise ValueError(
+                    f"Entry {idx} label {label!r} is not in the allowed label set: "
+                    f"{sorted(canonical_label_map.values())!r}."
+                )
+            # Canonicalize to the user-provided spelling.
+            label = canonical_label_map[key]
+
         boxes.append(
             NormalizedBBox(
-                label=label.strip(),
+                label=label,
                 x1=x1_i,
                 y1=y1_i,
                 x2=x2_i,
@@ -375,10 +439,19 @@ def draw_bboxes_on_frame(
         )
 
 
-def build_llm_messages(image_b64: str, description: str) -> list:
+def build_llm_messages(
+    image_b64: str,
+    description: str,
+    allowed_labels: List[str],
+) -> list:
     """
     Build the message list for Qwen3-VL, closely following Alibaba's grounding style.
+
+    In addition to the description, the model is given a finite set of valid labels.
+    For each detected object, it must choose exactly one label from this set.
     """
+    labels_block = "\n".join(f"- {label}" for label in allowed_labels)
+
     system_prompt = (
         "You are a precise 2D grounding assistant based on Qwen3-VL.\n"
         "Given **one image**, you must locate the requested objects and return their "
@@ -388,10 +461,14 @@ def build_llm_messages(image_b64: str, description: str) -> list:
         '  {"label": "<short object label>", "bbox_2d": [x1, y1, x2, y2]},\n'
         "  ...\n"
         "]\n\n"
+        "Valid labels (you MUST choose from this list and may not invent new labels):\n"
+        f"{labels_block}\n\n"
         "Rules:\n"
         "- Coordinates are normalized on a 1000x1000 grid.\n"
         "- Each coordinate is an integer in [0, 999].\n"
         "- x1 < x2 and y1 < y2.\n"
+        "- For each detected object, the 'label' field must be EXACTLY one of the valid\n"
+        "  labels listed above (match the spelling as closely as possible).\n"
         "- If no matching object exists, return [].\n"
         "- Do NOT output any extra text, comments, or explanations. Only pure JSON."
     )
@@ -400,6 +477,11 @@ def build_llm_messages(image_b64: str, description: str) -> list:
         "Locate every object that matches the following description in the image and "
         "return their 2D bounding boxes using the required JSON schema.\n\n"
         f"Objects of interest: {description}\n\n"
+        "You are also given a finite set of valid labels. For each detected object you\n"
+        "must choose exactly one label from this set and use it as the 'label' value in\n"
+        "the JSON output. Do not invent any new labels or synonyms.\n\n"
+        "Valid labels:\n"
+        f"{labels_block}\n\n"
         "Remember: output ONLY the JSON array. If there are no matches, output []."
     )
 
@@ -413,6 +495,7 @@ def build_llm_messages(image_b64: str, description: str) -> list:
 def run_llm_for_frame(
     frame_bgr: np.ndarray,
     description: str,
+    allowed_labels: List[str],
     frame_index: int,
     total_frames: int,
     client,
@@ -433,7 +516,7 @@ def run_llm_for_frame(
         attempt += 1
         b64_image = frame_to_base64_jpeg(frame_bgr, resized_w, resized_h)
 
-        messages = build_llm_messages(b64_image, description)
+        messages = build_llm_messages(b64_image, description, allowed_labels)
 
         params = ChatCompleteParams(
             messages=messages,
@@ -471,9 +554,9 @@ def run_llm_for_frame(
         raw_content = response.message.content
 
         try:
-            boxes = parse_bboxes_from_text(raw_content)
+            boxes = parse_bboxes_from_text(raw_content, allowed_labels=allowed_labels)
         except Exception as exc:
-            # The LLM misbehaved (non-JSON, bad coordinates, etc.); log and retry.
+            # The LLM misbehaved (non-JSON, bad coordinates, wrong labels, etc.); log and retry.
             preview = strip_think_tags(raw_content).strip()
             if len(preview) > 400:
                 preview = preview[:400] + "...[truncated]"
@@ -494,7 +577,7 @@ def run_llm_for_frame(
         return boxes
 
 
-def process_video(description: str) -> None:
+def process_video(description: str, allowed_labels: List[str]) -> None:
     if not os.path.exists(INPUT_VIDEO_PATH):
         raise FileNotFoundError(
             f"Expected input video at {INPUT_VIDEO_PATH!r}, but it does not exist."
@@ -567,6 +650,7 @@ def process_video(description: str) -> None:
             boxes = run_llm_for_frame(
                 frame_bgr=frame_bgr,
                 description=description,
+                allowed_labels=allowed_labels,
                 frame_index=frame_index,
                 total_frames=total_frames if total_frames > 0 else frame_index + 1,
                 client=client,
@@ -594,7 +678,7 @@ def process_video(description: str) -> None:
 def main() -> None:
     args = parse_args()
     try:
-        process_video(args.description)
+        process_video(args.description, args.allowed_labels)
     except Exception as exc:
         # Complain loudly and exit non-zero.
         print(f"[fatal] {exc}", file=sys.stderr, flush=True)

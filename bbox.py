@@ -469,6 +469,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    parser.add_argument(
+        "--preview",
+        action="store_true",
+        help=(
+            "Preview mode: use however many frames are present in the existing JSONL file "
+            "to render an annotated video, then exit without running the LLM on any new frames."
+        ),
+    )
+
     # No other CLI arguments are supported beyond --description and the labeling options, by design.
     args = parser.parse_args()
 
@@ -1139,7 +1148,7 @@ def validate_and_count_jsonl(jsonl_path: str, allowed_labels: List[str]) -> int:
     return frames_seen
 
 
-def process_video(description: str, allowed_labels: List[str]) -> None:
+def process_video(description: str, allowed_labels: List[str], preview: bool = False) -> None:
     if not os.path.exists(INPUT_VIDEO_PATH):
         raise FileNotFoundError(
             f"Expected input video at {INPUT_VIDEO_PATH!r}, but it does not exist."
@@ -1159,109 +1168,126 @@ def process_video(description: str, allowed_labels: List[str]) -> None:
     # Lawyerly checks + resize policy (may raise and abort early).
     resized_w, resized_h = compute_frame_resize(orig_width, orig_height)
 
-    # If base_url is omitted, it defaults to http://127.0.0.1:11434
-    connection = OllamaConnectionConfig(base_url="http://172.17.0.1:11434")
-    client = get_client(connection)
-
-    try:
-        frames_already_done = 0
-        if os.path.exists(FRAMES_JSONL_PATH):
-            print(
-                f"[resume] Detected existing JSONL file at {FRAMES_JSONL_PATH!r}, validating...",
-                flush=True,
-            )
-            frames_already_done = validate_and_count_jsonl(
-                FRAMES_JSONL_PATH, allowed_labels
-            )
-            print(
-                f"[resume] JSONL file contains {frames_already_done} frame(s).",
-                flush=True,
-            )
-        else:
-            os.makedirs(os.path.dirname(FRAMES_JSONL_PATH), exist_ok=True)
-
-        # Stage 1: run the LLM for all frames that do not yet have JSONL entries.
-        frame_index = 0
-        jsonl_mode = "a" if frames_already_done > 0 else "w"
-        decode_stream = FFmpegDecodeStream(
-            INPUT_VIDEO_PATH,
-            orig_width,
-            orig_height,
-            max_frames=None,
+    frames_already_done = 0
+    if os.path.exists(FRAMES_JSONL_PATH):
+        print(
+            f"[resume] Detected existing JSONL file at {FRAMES_JSONL_PATH!r}, validating...",
+            flush=True,
         )
-        try:
-            with open(FRAMES_JSONL_PATH, jsonl_mode, encoding="utf-8") as jsonl_file:
-                try:
-                    while True:
-                        frame_bgr = decode_stream.read_frame()
-                        if frame_bgr is None:
-                            break  # End of video.
-                        h, w = frame_bgr.shape[:2]
-                        if (w, h) != (orig_width, orig_height):
-                            raise RuntimeError(
-                                "Encountered a frame with different resolution within the same video. "
-                                f"Expected {orig_width}x{orig_height}, got {w}x{h} at frame {frame_index}."
-                            )
-
-                        if frame_index < frames_already_done:
-                            # This frame was already processed in a previous run; skip LLM.
-                            frame_index += 1
-                            continue
-
-                        boxes = run_llm_for_frame(
-                            frame_bgr=frame_bgr,
-                            description=description,
-                            allowed_labels=allowed_labels,
-                            frame_index=frame_index,
-                            fps=fps,
-                            duration=duration,
-                            client=client,
-                            connection=connection,
-                            resized_w=resized_w,
-                            resized_h=resized_h,
-                        )
-
-                        record = {
-                            "frame_index": frame_index,
-                            "boxes": [
-                                {
-                                    "label": box.label,
-                                    "x1": box.x1,
-                                    "y1": box.y1,
-                                    "x2": box.x2,
-                                    "y2": box.y2,
-                                }
-                                for box in boxes
-                            ],
-                        }
-                        jsonl_file.write(json.dumps(record, separators=(",", ":")) + "\n")
-                        jsonl_file.flush()
-
-                        frame_index += 1
-                except KeyboardInterrupt:
-                    print(
-                        "\n[interrupt] Caught CTRL+C. Partial JSONL results have been preserved "
-                        f"in {FRAMES_JSONL_PATH!r} and will be used for resuming.",
-                        flush=True,
-                    )
-                    decode_stream.terminate()
-                    raise SystemExit(130)
-        finally:
-            decode_stream.close(expect_zero_exit=True)
-
-        actual_frames_seen = frame_index
-
-        # Validate that the JSONL file cleanly covers all frames that were observed.
-        final_jsonl_frame_count = validate_and_count_jsonl(
+        frames_already_done = validate_and_count_jsonl(
             FRAMES_JSONL_PATH, allowed_labels
         )
-        if final_jsonl_frame_count != actual_frames_seen:
-            raise RuntimeError(
-                "Internal inconsistency between video frames and JSONL entries after processing.\n"
-                f"  - frames seen while reading video in Stage 1: {actual_frames_seen}\n"
-                f"  - valid JSONL entries:                       {final_jsonl_frame_count}\n"
-                "The script refuses to proceed with rendering an inconsistent state."
+        print(
+            f"[resume] JSONL file contains {frames_already_done} frame(s).",
+            flush=True,
+        )
+    else:
+        if preview:
+            raise FileNotFoundError(
+                f"Expected JSONL file at {FRAMES_JSONL_PATH!r} for preview mode, but it does not exist. "
+                "Run the script without --preview first to generate bounding boxes."
             )
+        os.makedirs(os.path.dirname(FRAMES_JSONL_PATH), exist_ok=True)
+
+    final_jsonl_frame_count = 0
+    client = None
+    connection = None
+
+    try:
+        if not preview:
+            # If base_url is omitted, it defaults to http://127.0.0.1:11434
+            connection = OllamaConnectionConfig(base_url="http://172.17.0.1:11434")
+            client = get_client(connection)
+
+            # Stage 1: run the LLM for all frames that do not yet have JSONL entries.
+            frame_index = 0
+            jsonl_mode = "a" if frames_already_done > 0 else "w"
+            decode_stream = FFmpegDecodeStream(
+                INPUT_VIDEO_PATH,
+                orig_width,
+                orig_height,
+                max_frames=None,
+            )
+            try:
+                with open(FRAMES_JSONL_PATH, jsonl_mode, encoding="utf-8") as jsonl_file:
+                    try:
+                        while True:
+                            frame_bgr = decode_stream.read_frame()
+                            if frame_bgr is None:
+                                break  # End of video.
+                            h, w = frame_bgr.shape[:2]
+                            if (w, h) != (orig_width, orig_height):
+                                raise RuntimeError(
+                                    "Encountered a frame with different resolution within the same video. "
+                                    f"Expected {orig_width}x{orig_height}, got {w}x{h} at frame {frame_index}."
+                                )
+
+                            if frame_index < frames_already_done:
+                                # This frame was already processed in a previous run; skip LLM.
+                                frame_index += 1
+                                continue
+
+                            boxes = run_llm_for_frame(
+                                frame_bgr=frame_bgr,
+                                description=description,
+                                allowed_labels=allowed_labels,
+                                frame_index=frame_index,
+                                fps=fps,
+                                duration=duration,
+                                client=client,
+                                connection=connection,
+                                resized_w=resized_w,
+                                resized_h=resized_h,
+                            )
+
+                            record = {
+                                "frame_index": frame_index,
+                                "boxes": [
+                                    {
+                                        "label": box.label,
+                                        "x1": box.x1,
+                                        "y1": box.y1,
+                                        "x2": box.x2,
+                                        "y2": box.y2,
+                                    }
+                                    for box in boxes
+                                ],
+                            }
+                            jsonl_file.write(json.dumps(record, separators=(",", ":")) + "\n")
+                            jsonl_file.flush()
+
+                            frame_index += 1
+                    except KeyboardInterrupt:
+                        print(
+                            "\n[interrupt] Caught CTRL+C. Partial JSONL results have been preserved "
+                            f"in {FRAMES_JSONL_PATH!r} and will be used for resuming.",
+                            flush=True,
+                        )
+                        decode_stream.terminate()
+                        raise SystemExit(130)
+            finally:
+                decode_stream.close(expect_zero_exit=True)
+
+            actual_frames_seen = frame_index
+
+            # Validate that the JSONL file cleanly covers all frames that were observed.
+            final_jsonl_frame_count = validate_and_count_jsonl(
+                FRAMES_JSONL_PATH, allowed_labels
+            )
+            if final_jsonl_frame_count != actual_frames_seen:
+                raise RuntimeError(
+                    "Internal inconsistency between video frames and JSONL entries after processing.\n"
+                    f"  - frames seen while reading video in Stage 1: {actual_frames_seen}\n"
+                    f"  - valid JSONL entries:                       {final_jsonl_frame_count}\n"
+                    "The script refuses to proceed with rendering an inconsistent state."
+                )
+        else:
+            # Preview mode: take however many frames the JSONL file has and render only those.
+            final_jsonl_frame_count = frames_already_done
+            if final_jsonl_frame_count == 0:
+                raise RuntimeError(
+                    f"JSONL file {FRAMES_JSONL_PATH!r} contains zero frame entries; nothing to preview."
+                )
 
         # Stage 2: now that the JSONL file has a clean entry for every frame, build the video.
         os.makedirs(os.path.dirname(OUTPUT_VIDEO_PATH), exist_ok=True)
@@ -1330,13 +1356,14 @@ def process_video(description: str, allowed_labels: List[str]) -> None:
             decode_stream2.close(expect_zero_exit=True)
             encode_stream.close(expect_zero_exit=True)
     finally:
-        client.close()
+        if client is not None:
+            client.close()
 
 
 def main() -> None:
     args = parse_args()
     try:
-        process_video(args.description, args.allowed_labels)
+        process_video(args.description, args.allowed_labels, preview=args.preview)
     except Exception as exc:
         # Complain loudly and exit non-zero.
         print(f"[fatal] {exc}", file=sys.stderr, flush=True)

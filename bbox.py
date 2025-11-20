@@ -25,6 +25,7 @@ from core.llm import (
 # Hard-coded IO paths (non-configurable, as requested)
 INPUT_VIDEO_PATH = "./workspace/input.mp4"
 OUTPUT_VIDEO_PATH = "./workspace/output.mp4"
+FRAMES_JSONL_PATH = "./workspace/frames.jsonl"
 
 # Qwen3-VL constraints / heuristics:
 # - Aspect ratio long/short must be <= 200 (per official docs).
@@ -577,6 +578,163 @@ def run_llm_for_frame(
         return boxes
 
 
+def parse_jsonl_line_to_bboxes(
+    line: str,
+    line_number: int,
+    expected_frame_index: int,
+    allowed_labels: List[str],
+) -> List[NormalizedBBox]:
+    """
+    Parse and validate a single JSONL line into a list of NormalizedBBox instances.
+
+    Each line must be a JSON object:
+    {
+      "frame_index": <int>,
+      "boxes": [
+        {"label": <str>, "x1": <int>, "y1": <int>, "x2": <int>, "y2": <int>},
+        ...
+      ]
+    }
+    """
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"JSONL line {line_number} is not valid JSON: {exc}"
+        ) from exc
+
+    if not isinstance(obj, dict):
+        raise ValueError(
+            f"JSONL line {line_number} must be a JSON object, got {type(obj).__name__}."
+        )
+
+    if "frame_index" not in obj:
+        raise ValueError(
+            f"JSONL line {line_number} is missing required 'frame_index' field."
+        )
+    if "boxes" not in obj:
+        raise ValueError(
+            f"JSONL line {line_number} is missing required 'boxes' field."
+        )
+
+    frame_index = obj["frame_index"]
+    if not isinstance(frame_index, int):
+        raise ValueError(
+            f"JSONL line {line_number} 'frame_index' must be an integer, "
+            f"got {type(frame_index).__name__}."
+        )
+    if frame_index != expected_frame_index:
+        raise ValueError(
+            "JSONL file is out of sync with the input video.\n"
+            f"Expected frame_index {expected_frame_index} at line {line_number}, "
+            f"but found {frame_index}."
+        )
+
+    boxes_raw = obj["boxes"]
+    if not isinstance(boxes_raw, list):
+        raise ValueError(
+            f"JSONL line {line_number} 'boxes' must be a list, "
+            f"got {type(boxes_raw).__name__}."
+        )
+
+    canonical_label_map: dict[str, str] = {
+        lbl.strip().lower(): lbl.strip()
+        for lbl in allowed_labels
+        if lbl and lbl.strip()
+    }
+    if not canonical_label_map:
+        raise ValueError(
+            "allowed_labels must contain at least one non-empty label when parsing JSONL."
+        )
+
+    boxes: List[NormalizedBBox] = []
+    for idx, item in enumerate(boxes_raw):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"JSONL line {line_number} 'boxes[{idx}]' must be an object, "
+                f"got {type(item).__name__}."
+            )
+
+        raw_label = item.get("label")
+        if not isinstance(raw_label, str) or not raw_label.strip():
+            raise ValueError(
+                f"JSONL line {line_number} 'boxes[{idx}]' is missing a non-empty 'label' field."
+            )
+        label = raw_label.strip()
+        key = label.lower()
+        if key not in canonical_label_map:
+            raise ValueError(
+                f"JSONL line {line_number} 'boxes[{idx}]' label {label!r} is not in the "
+                f"allowed label set: {sorted(canonical_label_map.values())!r}."
+            )
+        label = canonical_label_map[key]
+
+        for coord_name in ("x1", "y1", "x2", "y2"):
+            if coord_name not in item:
+                raise ValueError(
+                    f"JSONL line {line_number} 'boxes[{idx}]' is missing '{coord_name}' field."
+                )
+            if not isinstance(item[coord_name], int):
+                raise ValueError(
+                    f"JSONL line {line_number} 'boxes[{idx}].{coord_name}' must be an integer, "
+                    f"got {type(item[coord_name]).__name__}."
+                )
+
+        x1_i = item["x1"]
+        y1_i = item["y1"]
+        x2_i = item["x2"]
+        y2_i = item["y2"]
+
+        for coord_name, value in (("x1", x1_i), ("y1", y1_i), ("x2", x2_i), ("y2", y2_i)):
+            if not (0 <= value <= 999):
+                raise ValueError(
+                    f"JSONL line {line_number} 'boxes[{idx}].{coord_name}'={value} "
+                    "is out of [0, 999] range."
+                )
+
+        if not (x1_i < x2_i and y1_i < y2_i):
+            raise ValueError(
+                "JSONL line {line_number} 'boxes[{idx}]' must satisfy x1 < x2 and y1 < y2, "
+                f"got [{x1_i}, {y1_i}, {x2_i}, {y2_i}]."
+            )
+
+        boxes.append(
+            NormalizedBBox(
+                label=label,
+                x1=x1_i,
+                y1=y1_i,
+                x2=x2_i,
+                y2=y2_i,
+            )
+        )
+
+    return boxes
+
+
+def validate_and_count_jsonl(jsonl_path: str, allowed_labels: List[str]) -> int:
+    """
+    Validate the entire JSONL file and return the number of frames it contains.
+
+    Any deviation from the expected format or contents results in a loud exception.
+    """
+    frames_seen = 0
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line_number, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
+            if not line:
+                raise ValueError(
+                    f"JSONL file {jsonl_path!r} contains an empty line at line {line_number}."
+                )
+            _ = parse_jsonl_line_to_bboxes(
+                line=line,
+                line_number=line_number,
+                expected_frame_index=frames_seen,
+                allowed_labels=allowed_labels,
+            )
+            frames_seen += 1
+    return frames_seen
+
+
 def process_video(description: str, allowed_labels: List[str]) -> None:
     if not os.path.exists(INPUT_VIDEO_PATH):
         raise FileNotFoundError(
@@ -602,67 +760,179 @@ def process_video(description: str, allowed_labels: List[str]) -> None:
 
     # Lawyerly checks + resize policy (may raise and abort early).
     resized_w, resized_h = compute_frame_resize(orig_width, orig_height)
-    # Prepare output writer with original resolution & fps to preserve quality.
-    # Opinionated choice: always encode as MP4 using MPEG-4 Part 2 ('mp4v'),
-    # instead of guessing based on the input codec. If your OpenCV/FFmpeg build
-    # cannot encode 'mp4v', we fail loudly instead of silently falling back.
-    os.makedirs(os.path.dirname(OUTPUT_VIDEO_PATH), exist_ok=True)
-
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    fps_out = fps if fps > 0 else 25.0
-
-    out = cv2.VideoWriter(
-        OUTPUT_VIDEO_PATH,
-        fourcc,
-        fps_out,
-        (orig_width, orig_height),
-    )
-    if not out.isOpened():
-        cap.release()
-        raise RuntimeError(
-            "Failed to open output video for writing.\n"
-            "Reason: your OpenCV/FFmpeg build does not provide an encoder for the "
-            "explicitly requested 'mp4v' codec.\n"
-            "This script refuses to guess or fall back to other codecs. "
-            "Install/rebuild FFmpeg/OpenCV with an MP4 encoder (e.g. libx264/mp4v) "
-            "or change the hard-coded codec in bbox.py."
-        )
 
     # If base_url is omitted, it defaults to http://127.0.0.1:11434
     connection = OllamaConnectionConfig(base_url="http://172.17.0.1:11434")
     client = get_client(connection)
 
+    out = None
     try:
-        frame_index = 0
-        while True:
-            ret, frame_bgr = cap.read()
-            if not ret:
-                break  # End of video; do not rely solely on frame_count.
+        frames_already_done = 0
+        if os.path.exists(FRAMES_JSONL_PATH):
+            print(
+                f"[resume] Detected existing JSONL file at {FRAMES_JSONL_PATH!r}, validating...",
+                flush=True,
+            )
+            frames_already_done = validate_and_count_jsonl(
+                FRAMES_JSONL_PATH, allowed_labels
+            )
+            print(
+                f"[resume] JSONL file contains {frames_already_done} frame(s).",
+                flush=True,
+            )
+        else:
+            os.makedirs(os.path.dirname(FRAMES_JSONL_PATH), exist_ok=True)
 
-            # Safety check: if frame resolution ever differs, we bail out loudly.
-            h, w = frame_bgr.shape[:2]
-            if (w, h) != (orig_width, orig_height):
-                raise RuntimeError(
-                    "Encountered a frame with different resolution within the same video. "
-                    f"Expected {orig_width}x{orig_height}, got {w}x{h} at frame {frame_index}."
-                )
-
-            boxes = run_llm_for_frame(
-                frame_bgr=frame_bgr,
-                description=description,
-                allowed_labels=allowed_labels,
-                frame_index=frame_index,
-                total_frames=total_frames if total_frames > 0 else frame_index + 1,
-                client=client,
-                connection=connection,
-                resized_w=resized_w,
-                resized_h=resized_h,
+        if total_frames > 0 and frames_already_done > total_frames:
+            raise RuntimeError(
+                "Existing JSONL file appears to contain more frames than the input video reports.\n"
+                f"  - video frames (CAP_PROP_FRAME_COUNT): {total_frames}\n"
+                f"  - JSONL frames:                         {frames_already_done}\n"
+                "This script refuses to guess how to reconcile this mismatch. "
+                "Delete the JSONL file and re-run, or investigate the inconsistency."
             )
 
-            draw_bboxes_on_frame(frame_bgr, boxes)
-            out.write(frame_bgr)
+        # Stage 1: run the LLM for all frames that do not yet have JSONL entries.
+        frame_index = 0
+        jsonl_mode = "a" if frames_already_done > 0 else "w"
+        with open(FRAMES_JSONL_PATH, jsonl_mode, encoding="utf-8") as jsonl_file:
+            try:
+                while True:
+                    ret, frame_bgr = cap.read()
+                    if not ret:
+                        break  # End of video; do not rely solely on frame_count.
 
-            frame_index += 1
+                    h, w = frame_bgr.shape[:2]
+                    if (w, h) != (orig_width, orig_height):
+                        raise RuntimeError(
+                            "Encountered a frame with different resolution within the same video. "
+                            f"Expected {orig_width}x{orig_height}, got {w}x{h} at frame {frame_index}."
+                        )
+
+                    if frame_index < frames_already_done:
+                        # This frame was already processed in a previous run; skip LLM.
+                        frame_index += 1
+                        continue
+
+                    boxes = run_llm_for_frame(
+                        frame_bgr=frame_bgr,
+                        description=description,
+                        allowed_labels=allowed_labels,
+                        frame_index=frame_index,
+                        total_frames=total_frames if total_frames > 0 else frame_index + 1,
+                        client=client,
+                        connection=connection,
+                        resized_w=resized_w,
+                        resized_h=resized_h,
+                    )
+
+                    record = {
+                        "frame_index": frame_index,
+                        "boxes": [
+                            {
+                                "label": box.label,
+                                "x1": box.x1,
+                                "y1": box.y1,
+                                "x2": box.x2,
+                                "y2": box.y2,
+                            }
+                            for box in boxes
+                        ],
+                    }
+                    jsonl_file.write(json.dumps(record, separators=(",", ":")) + "\n")
+                    jsonl_file.flush()
+
+                    frame_index += 1
+            except KeyboardInterrupt:
+                print(
+                    "\n[interrupt] Caught CTRL+C. Partial JSONL results have been preserved "
+                    f"in {FRAMES_JSONL_PATH!r} and will be used for resuming.",
+                    flush=True,
+                )
+                raise SystemExit(130)
+
+        actual_frames_seen = frame_index
+
+        # Validate that the JSONL file cleanly covers all frames that were observed.
+        final_jsonl_frame_count = validate_and_count_jsonl(
+            FRAMES_JSONL_PATH, allowed_labels
+        )
+        if final_jsonl_frame_count != actual_frames_seen:
+            raise RuntimeError(
+                "Internal inconsistency between video frames and JSONL entries after processing.\n"
+                f"  - frames seen while reading video in Stage 1: {actual_frames_seen}\n"
+                f"  - valid JSONL entries:                        {final_jsonl_frame_count}\n"
+                "The script refuses to proceed with rendering an inconsistent state."
+            )
+
+        # Stage 2: now that the JSONL file has a clean entry for every frame, build the video.
+        cap.release()
+        cap = cv2.VideoCapture(INPUT_VIDEO_PATH)
+        if not cap.isOpened():
+            raise RuntimeError(
+                f"Failed to re-open input video for rendering: {INPUT_VIDEO_PATH}"
+            )
+
+        os.makedirs(os.path.dirname(OUTPUT_VIDEO_PATH), exist_ok=True)
+
+        # Opinionated choice: always encode as MP4 using MPEG-4 Part 2 ('mp4v'),
+        # instead of guessing based on the input codec. If your OpenCV/FFmpeg build
+        # cannot encode 'mp4v', we fail loudly instead of silently falling back.
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        fps_out = fps if fps > 0 else 25.0
+
+        out = cv2.VideoWriter(
+            OUTPUT_VIDEO_PATH,
+            fourcc,
+            fps_out,
+            (orig_width, orig_height),
+        )
+        if not out.isOpened():
+            raise RuntimeError(
+                "Failed to open output video for writing.\n"
+                "Reason: your OpenCV/FFmpeg build does not provide an encoder for the "
+                "explicitly requested 'mp4v' codec.\n"
+                "This script refuses to guess or fall back to other codecs. "
+                "Install/rebuild FFmpeg/OpenCV with an MP4 encoder (e.g. libx264/mp4v) "
+                "or change the hard-coded codec in bbox.py."
+            )
+
+        frame_index = 0
+        with open(FRAMES_JSONL_PATH, "r", encoding="utf-8") as jsonl_file:
+            for line_number, raw_line in enumerate(jsonl_file, start=1):
+                line = raw_line.strip()
+                if not line:
+                    raise ValueError(
+                        f"JSONL file {FRAMES_JSONL_PATH!r} contains an empty line at "
+                        f"line {line_number} while rendering."
+                    )
+
+                boxes = parse_jsonl_line_to_bboxes(
+                    line=line,
+                    line_number=line_number,
+                    expected_frame_index=frame_index,
+                    allowed_labels=allowed_labels,
+                )
+
+                ret, frame_bgr = cap.read()
+                if not ret:
+                    raise RuntimeError(
+                        "Input video ended earlier than expected while building the output video.\n"
+                        f"Expected at least {final_jsonl_frame_count} frames, but "
+                        f"cv2.VideoCapture returned EOF at frame index {frame_index}."
+                    )
+
+                h, w = frame_bgr.shape[:2]
+                if (w, h) != (orig_width, orig_height):
+                    raise RuntimeError(
+                        "Encountered a frame with different resolution while rendering. "
+                        f"Expected {orig_width}x{orig_height}, got {w}x{h} at frame {frame_index}."
+                    )
+
+                draw_bboxes_on_frame(frame_bgr, boxes)
+                out.write(frame_bgr)
+
+                frame_index += 1
 
         print(
             f"[done] Processed {frame_index} frame(s). "
@@ -671,7 +941,8 @@ def process_video(description: str, allowed_labels: List[str]) -> None:
         )
     finally:
         cap.release()
-        out.release()
+        if out is not None:
+            out.release()
         client.close()
 
 

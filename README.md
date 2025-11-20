@@ -10,7 +10,7 @@ That LLM knows how to output json bounding boxes normalized to 1000x1000 pixels,
 
 2. Run:
     ```sh
-    python3 bbox.py --description "Anything that vaguely lookslike a colorful pixelated cloudy blob throughout the 2d/3d visualization"
+    python3 bbox.py --description "Anything that vaguely lookslike a colorful pixelated cloudy blob throughout the 2d/3d visualization" --labels "cloudy blob"
     ```
 
 3. Wait minutes to hours, and get your [./workspace/input.mp4](./workspace/output.mp4)

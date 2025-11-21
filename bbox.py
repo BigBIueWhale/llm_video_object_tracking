@@ -1266,7 +1266,10 @@ def process_video(description: str, allowed_labels: List[str], preview: bool = F
                         decode_stream.terminate()
                         raise SystemExit(130)
             finally:
-                decode_stream.close(expect_zero_exit=True)
+                # If we're unwinding from an exception, don't let a non-zero ffmpeg exit
+                # (for example due to a broken pipe) hide the real error.
+                in_exception = sys.exc_info()[0] is not None
+                decode_stream.close(expect_zero_exit=not in_exception)
 
             actual_frames_seen = frame_index
 
@@ -1351,10 +1354,11 @@ def process_video(description: str, allowed_labels: List[str], preview: bool = F
                 flush=True,
             )
         finally:
-            # In the happy path this enforces zero exit codes; in exceptional paths it may
-            # raise additional errors which are acceptable since we are already failing loudly.
-            decode_stream2.close(expect_zero_exit=True)
-            encode_stream.close(expect_zero_exit=True)
+            # As in Stage 1, avoid letting ffmpeg shutdown errors (e.g. broken pipes when
+            # we've already stopped reading/writing) mask the original Python exception.
+            in_exception = sys.exc_info()[0] is not None
+            decode_stream2.close(expect_zero_exit=not in_exception)
+            encode_stream.close(expect_zero_exit=not in_exception)
     finally:
         if client is not None:
             client.close()

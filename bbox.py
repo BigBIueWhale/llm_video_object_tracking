@@ -326,6 +326,8 @@ class FFmpegEncodeStream:
         self.fps = fps
         self._closed = False
 
+        # Opinionated choice: always encode as MP4 using H.264 (libx264) with a high-quality
+        # CRF-based setting that keeps 4K looking clean while still using sane compression.
         cmd: list[str] = [
             "ffmpeg",
             "-v",
@@ -342,10 +344,14 @@ class FFmpegEncodeStream:
             "-",
             "-y",
             "-an",
-            # Opinionated choice: always encode as MP4 using MPEG-4 Part 2 ('mp4v')
-            # rather than guessing based on the input codec.
             "-c:v",
-            "mpeg4",
+            "libx264",
+            "-preset",
+            "slow",      # better compression efficiency for a given quality
+            "-crf",
+            "17",        # visually near-lossless for 4K in most cases
+            "-pix_fmt",
+            "yuv420p",   # widely compatible
             output_path,
         ]
         self.cmd = cmd
@@ -359,7 +365,7 @@ class FFmpegEncodeStream:
         except FileNotFoundError as exc:
             raise RuntimeError(
                 "Failed to start ffmpeg for encoding output video: executable not found. "
-                "Ensure 'ffmpeg' is installed and available on PATH."
+                "Ensure 'ffmpeg' with libx264 support is installed and available on PATH."
             ) from exc
 
         if proc.stdin is None:
@@ -411,8 +417,7 @@ class FFmpegEncodeStream:
                 f"Command: {' '.join(self.cmd)}\n"
                 f"Exit code: {ret}\n"
                 "This likely means your ffmpeg build does not provide an encoder for the "
-                "explicitly requested 'mpeg4' codec (FourCC 'mp4v'), or the output file "
-                "could not be written."
+                "explicitly requested 'libx264' codec, or the output file could not be written."
             )
 
     def close(self, expect_zero_exit: bool = True) -> None:

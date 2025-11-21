@@ -8,6 +8,7 @@ import os
 import sys
 import subprocess
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import List
 
 import cv2
@@ -114,22 +115,74 @@ def probe_video_metadata(path: str) -> tuple[int, int, float, float]:
             f"Reported width={width}, height={height}."
         )
 
-    avg_frame_rate = stream.get("avg_frame_rate") or "0/0"
-    fps = 0.0
-    if isinstance(avg_frame_rate, str) and "/" in avg_frame_rate:
-        num_str, den_str = avg_frame_rate.split("/", 1)
+    # FPS extraction is now strict: either we get a sane, positive FPS value or we fail loudly.
+    raw_avg_frame_rate = stream.get("avg_frame_rate")
+
+    def _stream_meta_snippet() -> str:
         try:
-            num = float(num_str)
-            den = float(den_str)
-            if den != 0:
-                fps = num / den
-        except ValueError:
-            fps = 0.0
-    else:
-        try:
-            fps = float(avg_frame_rate)
-        except (TypeError, ValueError):
-            fps = 0.0
+            return json.dumps(stream, indent=2)[:1000]
+        except Exception:
+            return repr(stream)[:1000]
+
+    if raw_avg_frame_rate is None:
+        raise RuntimeError(
+            "ffprobe did not report 'avg_frame_rate' for the primary video stream. "
+            "Expected a rational string like '30000/1001'.\n"
+            f"Stream metadata snippet:\n{_stream_meta_snippet()}"
+        )
+
+    if not isinstance(raw_avg_frame_rate, str):
+        raise RuntimeError(
+            "ffprobe reported 'avg_frame_rate' with an unexpected type.\n"
+            f"Expected a string like '30000/1001', got {type(raw_avg_frame_rate).__name__}: "
+            f"{raw_avg_frame_rate!r}.\n"
+            f"Stream metadata snippet:\n{_stream_meta_snippet()}"
+        )
+
+    if "/" not in raw_avg_frame_rate:
+        raise RuntimeError(
+            "ffprobe reported 'avg_frame_rate' in an unexpected format.\n"
+            f"Expected '<numerator>/<denominator>', got {raw_avg_frame_rate!r}.\n"
+            f"Stream metadata snippet:\n{_stream_meta_snippet()}"
+        )
+
+    try:
+        fps_fraction = Fraction(raw_avg_frame_rate)
+    except ZeroDivisionError as exc:
+        raise RuntimeError(
+            "ffprobe reported 'avg_frame_rate' with a zero denominator, which is invalid.\n"
+            f"avg_frame_rate={raw_avg_frame_rate!r}.\n"
+            f"Stream metadata snippet:\n{_stream_meta_snippet()}"
+        ) from exc
+    except ValueError as exc:
+        raise RuntimeError(
+            "ffprobe reported 'avg_frame_rate' that could not be parsed as a rational number.\n"
+            f"avg_frame_rate={raw_avg_frame_rate!r}.\n"
+            f"Error: {exc}\n"
+            f"Stream metadata snippet:\n{_stream_meta_snippet()}"
+        ) from exc
+
+    fps = float(fps_fraction)
+
+    if not math.isfinite(fps) or fps <= 0.0:
+        raise RuntimeError(
+            "Derived FPS from ffprobe 'avg_frame_rate' is non-positive or non-finite.\n"
+            f"avg_frame_rate={raw_avg_frame_rate!r}, derived fps={fps!r}.\n"
+            f"Stream metadata snippet:\n{_stream_meta_snippet()}"
+        )
+
+    # Sanity check: reject extremely small or extremely large FPS values as likely metadata bugs.
+    # Typical real-world frame rates are in the ~1–240 fps range; we allow a wider band but still
+    # insist on something that looks sane.
+    if fps < 1.0 or fps > 1000.0:
+        raise RuntimeError(
+            "Derived FPS from ffprobe 'avg_frame_rate' is outside the expected sanity range "
+            "[1.0, 1000.0]. This likely indicates problematic or missing metadata.\n"
+            f"avg_frame_rate={raw_avg_frame_rate!r}, derived fps={fps:.6f}.\n"
+            "If this FPS is actually correct for your content, adjust the sanity check in "
+            "probe_video_metadata().\n"
+            f"Stream metadata snippet:\n{_stream_meta_snippet()}"
+        )
 
     # Prefer stream-level duration, but fall back to format-level if needed.
     duration = 0.0
@@ -918,6 +971,13 @@ def run_llm_for_frame(
     Progress reporting is based on timestamps derived from fps/duration rather than
     total frame counts, so we never rely on nb_frames metadata.
     """
+    if fps <= 0.0 or not math.isfinite(fps):
+        raise ValueError(
+            "run_llm_for_frame expected a positive, finite fps value. "
+            f"Got fps={fps!r}. This indicates a bug in probe_video_metadata() or an "
+            "invalid caller."
+        )
+
     attempt = 0
     model_name = "qwen3-vl:32b-thinking"
 
@@ -926,19 +986,19 @@ def run_llm_for_frame(
         Build a human-friendly progress prefix using time-based information.
         """
         display_frame = frame_index + 1
-        if fps > 0.0:
-            current_time_s = frame_index / fps
-            if duration > 0.0:
-                progress = min(1.0, current_time_s / duration)
-                return (
-                    f"[frame {display_frame}]"
-                    f"[t={current_time_s:.2f}s/{duration:.2f}s "
-                    f"({progress * 100.0:5.1f}%)]"
-                )
-            else:
-                return f"[frame {display_frame}][t={current_time_s:.2f}s]"
+
+        # fps is guaranteed to be positive and finite by the check at the start of
+        # this function.
+        current_time_s = frame_index / fps
+        if duration > 0.0:
+            progress = min(1.0, current_time_s / duration)
+            return (
+                f"[frame {display_frame}]"
+                f"[t={current_time_s:.2f}s/{duration:.2f}s "
+                f"({progress * 100.0:5.1f}%)]"
+            )
         else:
-            return f"[frame {display_frame}]"
+            return f"[frame {display_frame}][t={current_time_s:.2f}s]"
 
     while True:
         attempt += 1
@@ -1306,7 +1366,8 @@ def process_video(description: str, allowed_labels: List[str], preview: bool = F
         # Stage 2: now that the JSONL file has a clean entry for every frame, build the video.
         os.makedirs(os.path.dirname(OUTPUT_VIDEO_PATH), exist_ok=True)
 
-        fps_out = fps if fps > 0 else 25.0
+        # fps has already been validated as positive and finite in probe_video_metadata().
+        fps_out = fps
 
         decode_stream2 = FFmpegDecodeStream(
             INPUT_VIDEO_PATH,

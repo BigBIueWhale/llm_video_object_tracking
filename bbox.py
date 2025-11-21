@@ -248,6 +248,8 @@ class FFmpegDecodeStream:
         if buf is None:
             return None
 
+        # Create an array from the raw buffer and ensure it is writeable so OpenCV
+        # can draw on it in-place during rendering.
         frame = np.frombuffer(buf, dtype=np.uint8)
         try:
             frame = frame.reshape((self.height, self.width, 3))
@@ -256,6 +258,10 @@ class FFmpegDecodeStream:
                 "Decoded raw frame from ffmpeg has unexpected size when reshaping.\n"
                 f"Expected {self.height}x{self.width}x3 bytes."
             ) from exc
+
+        if not frame.flags.writeable:
+            frame = frame.copy()
+
         return frame
 
     def _wait(self, expect_zero_exit: bool) -> None:

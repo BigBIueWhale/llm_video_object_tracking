@@ -988,7 +988,8 @@ def build_llm_messages(
     user_prompt = (
         "Locate every object that matches the following description in the image and "
         "return their 2D bounding boxes using the required JSON schema.\n\n"
-        f"User instruction: {description}\n\n"
+        f"User instruction: {description}\n"
+        "I need the list to be very much exhaustive, including even the smallest, farthest away, and least visible objects on screen, individually bounded.\n\n"
         "You are also given a finite set of valid labels. For each detected object you\n"
         "must choose exactly one label from this set and use it as the 'label' value in\n"
         "the JSON output. Do not invent any new labels or synonyms.\n\n"

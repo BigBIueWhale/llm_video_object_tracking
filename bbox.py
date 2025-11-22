@@ -28,6 +28,7 @@ from core.llm import (
 INPUT_VIDEO_PATH = "./workspace/input.mp4"
 OUTPUT_VIDEO_PATH = "./workspace/output.mp4"
 FRAMES_JSONL_PATH = "./workspace/frames.jsonl"
+FRAMES_DEBUG_DIR = "./workspace/frames"
 
 # Qwen3-VL constraints / heuristics:
 # - Aspect ratio long/short must be <= 200 (per official docs).
@@ -680,6 +681,88 @@ def frame_to_base64_jpeg(frame_bgr: np.ndarray, target_w: int, target_h: int) ->
     return base64.b64encode(buf).decode("ascii")
 
 
+def save_debug_frame_from_base64_image(image_b64: str, frame_index: int) -> None:
+    """
+    Persist exactly what is being sent to the LLM for debugging.
+
+    Behavior (opinionated, with no silent fallbacks):
+    - Decode the base64 string that is fed into the LLM.
+    - First, attempt to write the raw bytes directly as a JPEG file to
+      ./workspace/frames/0000000001.jpg (and so on), where the number is
+      the 1-based frame index in the original video, zero-padded to 10 digits.
+      This preserves the exact compressed representation the LLM sees.
+    - If writing the JPEG file fails for any reason, decode the bytes into an
+      image and attempt to write a lossless PNG instead
+      ./workspace/frames/0000000001.png.
+    - If either base64 decoding, JPEG writing, or PNG writing fails, raise a
+      verbose RuntimeError describing what was supposed to happen and what
+      actually failed.
+    """
+    # Ensure the debug directory exists.
+    try:
+        os.makedirs(FRAMES_DEBUG_DIR, exist_ok=True)
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to create the debug frames directory for persisting LLM input images.\n"
+            f"Expected to create or reuse directory {FRAMES_DEBUG_DIR!r}, but os.makedirs "
+            f"raised {type(exc).__name__}: {exc}"
+        ) from exc
+
+    frame_number = frame_index + 1
+    jpeg_path = os.path.join(FRAMES_DEBUG_DIR, f"{frame_number:010d}.jpg")
+    png_path = os.path.join(FRAMES_DEBUG_DIR, f"{frame_number:010d}.png")
+
+    # Decode the base64 payload that is being sent to the LLM.
+    try:
+        img_bytes = base64.b64decode(image_b64.encode("ascii"), validate=True)
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to base64-decode the LLM image payload while attempting to write a "
+            "debug frame file.\n"
+            f"This should have been a valid ASCII base64 string representing the exact "
+            f"bytes fed into the LLM for frame_index={frame_index}, but decoding raised "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    # Primary attempt: persist the exact compressed representation as a JPEG file.
+    try:
+        with open(jpeg_path, "wb") as f:
+            f.write(img_bytes)
+        return
+    except Exception as exc_primary:
+        # Secondary attempt: preserve the pixel content losslessly as a PNG file.
+        try:
+            img_array = np.frombuffer(img_bytes, dtype=np.uint8)
+            img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            if img is None:
+                raise RuntimeError(
+                    "cv2.imdecode returned None when attempting to decode the LLM image "
+                    f"bytes for frame_index={frame_index}. The bytes could not be interpreted "
+                    "as a valid image."
+                )
+            ok, png_buf = cv2.imencode(".png", img)
+            if not ok:
+                raise RuntimeError(
+                    "cv2.imencode('.png', ...) returned False when attempting to encode a "
+                    f"lossless debug PNG for frame_index={frame_index}."
+                )
+            with open(png_path, "wb") as f:
+                f.write(png_buf.tobytes())
+            return
+        except Exception as exc_secondary:
+            raise RuntimeError(
+                "Failed to persist a debug image file representing the exact content fed "
+                "into the LLM for a given frame.\n"
+                f"- Primary operation (writing raw JPEG bytes to {jpeg_path!r}) failed with "
+                f"{type(exc_primary).__name__}: {exc_primary}\n"
+                f"- Secondary operation (decoding those bytes and writing a PNG to "
+                f"{png_path!r}) also failed with {type(exc_secondary).__name__}: "
+                f"{exc_secondary}\n"
+                "As a result, no debug image file could be written for this frame. This "
+                "indicates an unexpected filesystem, OpenCV, or data integrity issue."
+            ) from exc_secondary
+
+
 def strip_think_tags(text: str) -> str:
     """
     Remove <think>...</think> blocks from Qwen3-VL thinking outputs so we can parse JSON.
@@ -1058,6 +1141,11 @@ def run_llm_for_frame(
     while True:
         attempt += 1
         b64_image = frame_to_base64_jpeg(frame_bgr, resized_w, resized_h)
+
+        # Persist a debug frame file constructed directly from the exact base64 payload
+        # that is about to be sent to the LLM. This ensures that the JPEG or PNG on disk
+        # faithfully represents what the model actually receives.
+        save_debug_frame_from_base64_image(b64_image, frame_index)
 
         messages = build_llm_messages(b64_image, description, allowed_labels)
 

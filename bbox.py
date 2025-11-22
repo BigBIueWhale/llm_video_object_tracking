@@ -9,7 +9,7 @@ import sys
 import subprocess
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import List
+from typing import List, Tuple
 
 import cv2
 import numpy as np
@@ -36,6 +36,20 @@ FRAMES_JSONL_PATH = "./workspace/frames.jsonl"
 MAX_ABS_ASPECT_RATIO = 200.0
 MIN_DIMENSION = 10
 QWEN_NORMALIZATION_GRID = 999.0  # coordinates are in [0, 999]
+
+# Palette of dark, high-contrast BGR colors used to style bounding boxes and label
+# backgrounds based on the *index* of the label in the user-provided list.
+# The first entry preserves the original red styling for the first label.
+LABEL_COLOR_PALETTE_BGR: List[Tuple[int, int, int]] = [
+    (0, 0, 255),      # red (first label)
+    (0, 128, 0),      # dark green
+    (255, 0, 0),      # dark blue
+    (0, 128, 128),    # dark cyan / teal
+    (128, 0, 128),    # dark magenta / purple
+    (128, 128, 0),    # olive
+    (128, 0, 0),      # maroon
+    (0, 128, 255),    # dark orange
+]
 
 
 @dataclass
@@ -542,7 +556,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
-    # No other CLI arguments are supported beyond --description and the labeling options, by design.
+    parser.add_argument(
+        "--boxes-only",
+        dest="boxes_only",
+        action="store_true",
+        help=(
+            "Draw only colored bounding boxes (no label text or background). "
+            "Box color is determined by the index of the label in the allowed label list."
+        ),
+    )
+
+    # No other CLI arguments are supported beyond --description, the labeling options,
+    # --preview, and --boxes-only, by design.
     args = parser.parse_args()
 
     # Normalize the labels into a single canonical list for downstream code.
@@ -832,9 +857,16 @@ def parse_bboxes_from_text(
 def draw_bboxes_on_frame(
     frame_bgr: np.ndarray,
     bboxes: List[NormalizedBBox],
+    allowed_labels: List[str],
+    boxes_only: bool = False,
 ) -> None:
     """
     Draw normalized bounding boxes on the frame in-place at the original video resolution.
+
+    Box and label background colors are chosen based on the index of the label in the
+    user-specified allowed_labels list (with wrap-around over a small, high-quality
+    color palette). Text is always rendered in white. When boxes_only=True, only the
+    colored boxes are drawn (no label text or background).
     """
     height, width = frame_bgr.shape[:2]
 
@@ -846,6 +878,22 @@ def draw_bboxes_on_frame(
     thickness = max(2, int(round(min_side / 400)))
     font_scale = max(0.5, min_side / 800.0)
     font = cv2.FONT_HERSHEY_SIMPLEX
+
+    # Precompute a stable mapping from canonical label -> index, then to BGR color.
+    label_to_index: dict[str, int] = {}
+    for idx, lbl in enumerate(allowed_labels):
+        canonical = lbl.strip()
+        if not canonical:
+            continue
+        if canonical not in label_to_index:
+            label_to_index[canonical] = idx
+
+    def _color_for_label(label: str) -> Tuple[int, int, int]:
+        idx = label_to_index.get(label, 0)
+        palette_idx = idx % len(LABEL_COLOR_PALETTE_BGR)
+        return LABEL_COLOR_PALETTE_BGR[palette_idx]
+
+    color_text = (255, 255, 255)
 
     for box in bboxes:
         # Map from [0, 999] grid to pixel coordinates.
@@ -864,11 +912,16 @@ def draw_bboxes_on_frame(
             # Degenerate after rounding; skip this one.
             continue
 
-        # Box color: red; label background: filled red, text in white.
-        color_box = (0, 0, 255)
-        color_text = (255, 255, 255)
+        # Box & label background color: chosen from the palette based on label index;
+        # text is always white for contrast.
+        color_box = _color_for_label(box.label)
 
         cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), color_box, thickness)
+
+        if boxes_only:
+            # In boxes-only mode we deliberately skip drawing label text and its background
+            # to hide underlying video content as little as possible.
+            continue
 
         label_text = box.label
         (text_w, text_h), baseline = cv2.getTextSize(
@@ -1219,7 +1272,12 @@ def validate_and_count_jsonl(jsonl_path: str, allowed_labels: List[str]) -> int:
     return frames_seen
 
 
-def process_video(description: str, allowed_labels: List[str], preview: bool = False) -> None:
+def process_video(
+    description: str,
+    allowed_labels: List[str],
+    preview: bool = False,
+    boxes_only: bool = False,
+) -> None:
     if not os.path.exists(INPUT_VIDEO_PATH):
         raise FileNotFoundError(
             f"Expected input video at {INPUT_VIDEO_PATH!r}, but it does not exist."
@@ -1415,7 +1473,12 @@ def process_video(description: str, allowed_labels: List[str], preview: bool = F
                             f"Expected {orig_width}x{orig_height}, got {w}x{h} at frame {frame_index}."
                         )
 
-                    draw_bboxes_on_frame(frame_bgr, boxes)
+                    draw_bboxes_on_frame(
+                        frame_bgr,
+                        boxes,
+                        allowed_labels=allowed_labels,
+                        boxes_only=boxes_only,
+                    )
                     encode_stream.write_frame(frame_bgr)
 
                     frame_index += 1
@@ -1439,7 +1502,12 @@ def process_video(description: str, allowed_labels: List[str], preview: bool = F
 def main() -> None:
     args = parse_args()
     try:
-        process_video(args.description, args.allowed_labels, preview=args.preview)
+        process_video(
+            args.description,
+            args.allowed_labels,
+            preview=args.preview,
+            boxes_only=args.boxes_only,
+        )
     except Exception as exc:
         # Complain loudly and exit non-zero.
         print(f"[fatal] {exc}", file=sys.stderr, flush=True)

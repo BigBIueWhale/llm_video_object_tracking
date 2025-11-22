@@ -982,12 +982,13 @@ def build_llm_messages(
         "  labels listed above (match the spelling as closely as possible).\n"
         "- If no matching object exists, return [].\n"
         "- Do NOT output any extra text, comments, or explanations. Only pure JSON."
+        "- Exhaustively and thoroughly create a **complete** list or everything relevant that is visible with one unique bounding box for each object, even when very far away or taking a tiny portion of the frame."
     )
 
     user_prompt = (
         "Locate every object that matches the following description in the image and "
         "return their 2D bounding boxes using the required JSON schema.\n\n"
-        f"Objects of interest: {description}\n\n"
+        f"User instruction: {description}\n\n"
         "You are also given a finite set of valid labels. For each detected object you\n"
         "must choose exactly one label from this set and use it as the 'label' value in\n"
         "the JSON output. Do not invent any new labels or synonyms.\n\n"

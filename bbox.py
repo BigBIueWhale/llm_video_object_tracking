@@ -34,9 +34,20 @@ FRAMES_DEBUG_DIR = "./workspace/frames"
 # - Aspect ratio long/short must be <= 200 (per official docs).
 # - Width & height must be > 10 pixels.
 # - For grounding, the model uses a 1000x1000 normalized grid for bbox coordinates.
+# - The Qwen3-VL image preprocessor's pixel budget for a single image (H x W) is:
+#     * min_pixels  = 65,536   (≈ 256 x 256)
+#     * max_pixels  = 16,777,216 (≈ 4096 x 4096)
+#   In the official Qwen3-VL processors, these are enforced on the *total* number
+#   of pixels H * W (not per-side caps), with aspect-ratio constraints handled
+#   separately. We replicate that logic here as a hard validation gate and refuse
+#   to resize frames ourselves; any dynamic resizing & patch-aligned handling are
+#   delegated to Ollama's Qwen3-VL image processor.
 MAX_ABS_ASPECT_RATIO = 200.0
 MIN_DIMENSION = 10
 QWEN_NORMALIZATION_GRID = 999.0  # coordinates are in [0, 999]
+
+QWEN3_VL_MIN_PIXELS = 65536        # 256 x 256, from Qwen3-VL preprocessor_config shortest_edge
+QWEN3_VL_MAX_PIXELS = 16777216     # 4096 x 4096, from Qwen3-VL preprocessor_config longest_edge
 
 # Palette of dark, high-contrast BGR colors used to style bounding boxes and label
 # backgrounds based on the *index* of the label in the user-provided list.
@@ -594,90 +605,127 @@ def lawyerly_video_checks(width: int, height: int) -> None:
     """
     Enforce Qwen3-VL-style constraints in an opinionated, 'lawyerly' way.
 
-    - Reject extremely skewed aspect ratios (long/short > 200).
-    - Reject videos with tiny dimensions (< 10px on any side).
+    This function unifies:
+      - Basic sanity checks on the frame geometry, and
+      - The Qwen3-VL image budget constraints derived from its official
+        preprocessor_config.json.
+
+    Constraints enforced (all must pass, or we raise a detailed ValueError):
+
+    1. Positive dimensions:
+       - width > 0 and height > 0 are required for any sensible image.
+
+    2. Minimum dimension:
+       - width >= MIN_DIMENSION and height >= MIN_DIMENSION.
+       - Qwen3-VL docs require width & height > 10 pixels; we keep the same
+         lawyerly lower bound to avoid absurdly tiny frames.
+
+    3. Aspect ratio:
+       - max(width, height) / min(width, height) <= MAX_ABS_ASPECT_RATIO.
+       - Qwen3-VL specifies that the absolute aspect ratio must not exceed 200:1.
+
+    4. Total pixel budget (H * W):
+       - QWEN3_VL_MIN_PIXELS <= width * height <= QWEN3_VL_MAX_PIXELS.
+       - The official Qwen3-VL preprocessor defines:
+           * shortest_edge = 65,536
+           * longest_edge  = 16,777,216
+         and uses these as bounds on H * W (total number of pixels) rather
+         than independent per-side caps. That means:
+           * Very small images (< ~256 x 256) are considered out-of-budget.
+           * Very large images (> ~4096 x 4096 in area) must be downscaled.
+         We do *not* downscale or upscale here; if a frame falls outside this
+         range, we fail loudly and ask the caller to adjust the video upstream.
+
+    Note: Qwen3-VL's own image processor will apply its dynamic resizing /
+    patch-aligned logic internally (SmartResize / multiples of 32, etc.).
+    Our job in this function is to ensure that every frame is at least in
+    the same broad regime as the model's training-time preprocessing.
     """
+    errors: list[str] = []
+
+    # 1. Positive dimensions.
     if width <= 0 or height <= 0:
-        raise ValueError(f"Video has non-positive dimensions: width={width}, height={height}.")
+        errors.append(
+            "Video has non-positive dimensions.\n"
+            f"  - width={width}, height={height}\n"
+            "Both width and height must be strictly positive for Qwen3-VL."
+        )
 
+    # 2. Minimum dimension.
     if width < MIN_DIMENSION or height < MIN_DIMENSION:
-        raise ValueError(
-            f"Video frame dimensions {width}x{height} are too small. "
-            f"Qwen3-VL requires width and height to be greater than {MIN_DIMENSION} pixels."
-        )
-
-    long_edge = max(width, height)
-    short_edge = min(width, height)
-    aspect_ratio = long_edge / short_edge
-
-    if aspect_ratio > MAX_ABS_ASPECT_RATIO:
-        raise ValueError(
-            "No, you can't use that video: its aspect ratio exceeds Qwen3-VL's recommended limit.\n"
+        errors.append(
+            "Video frame dimensions are too small for Qwen3-VL.\n"
             f"  - width x height = {width} x {height}\n"
-            f"  - long/short edge ratio = {aspect_ratio:.2f} > {MAX_ABS_ASPECT_RATIO:.0f}\n"
-            "The absolute aspect ratio must be <= 200:1 or 1:200 according to the Qwen-VL docs."
+            f"  - required: width >= {MIN_DIMENSION} and height >= {MIN_DIMENSION}\n"
+            "Qwen3-VL requires width and height to be greater than 10 pixels."
         )
 
+    # 3. Aspect ratio.
+    if width > 0 and height > 0:
+        long_edge = max(width, height)
+        short_edge = min(width, height)
+        if short_edge > 0:
+            aspect_ratio = long_edge / short_edge
+            if aspect_ratio > MAX_ABS_ASPECT_RATIO:
+                errors.append(
+                    "No, you can't use that video: its aspect ratio exceeds Qwen3-VL's "
+                    "recommended limit.\n"
+                    f"  - width x height = {width} x {height}\n"
+                    f"  - long/short edge ratio = {aspect_ratio:.2f} > {MAX_ABS_ASPECT_RATIO:.0f}\n"
+                    "The absolute aspect ratio must be <= 200:1 or 1:200 according to the Qwen-VL docs."
+                )
 
-def compute_frame_resize(width: int, height: int) -> tuple[int, int]:
-    """
-    Decide how to resize frames before sending them to the LLM.
+    # 4. Total pixel budget.
+    if width > 0 and height > 0:
+        pixels = width * height
+        if pixels < QWEN3_VL_MIN_PIXELS:
+            errors.append(
+                "Frame is too small for Qwen3-VL's configured pixel budget.\n"
+                f"  - width x height = {width} x {height} = {pixels} pixels\n"
+                f"  - required minimum total pixels (H*W) = {QWEN3_VL_MIN_PIXELS} "
+                "(≈ 256 x 256)\n"
+                "This script refuses to upscale tiny frames automatically. "
+                "Use a higher-resolution input video or pre-process it upstream."
+            )
+        if pixels > QWEN3_VL_MAX_PIXELS:
+            errors.append(
+                "Frame is too large for Qwen3-VL's configured pixel budget.\n"
+                f"  - width x height = {width} x {height} = {pixels} pixels\n"
+                f"  - allowed maximum total pixels (H*W) = {QWEN3_VL_MAX_PIXELS} "
+                "(≈ 4096 x 4096)\n"
+                "This script refuses to downscale oversized frames automatically. "
+                "Downscale the video externally (e.g. via ffmpeg) before using this script."
+            )
 
-    Policy (opinionated):
-    - If the long edge is <= 1000 px, keep original resolution.
-    - If the long edge is > 1000 px, downscale so that the long edge becomes 1000 px,
-      preserving aspect ratio. No cropping is ever performed.
-
-    This keeps us near the 1000x1000 normalized training grid while preserving all content.
-    """
-    lawyerly_video_checks(width, height)
-
-    long_edge = max(width, height)
-    short_edge = min(width, height)
-
-    if long_edge <= 1000:
-        # Within the "sweet spot" already; no resize.
-        print(
-            f"[video] Using original frame resolution {width}x{height} "
-            "(long edge <= 1000px, no downscale needed).",
-            flush=True,
-        )
-        return width, height
-
-    scale = 1000.0 / float(long_edge)
-    new_width = int(round(width * scale))
-    new_height = int(round(height * scale))
-
-    # Safety against rounding to < MIN_DIMENSION on one side.
-    if new_width < MIN_DIMENSION or new_height < MIN_DIMENSION:
+    if errors:
         raise ValueError(
-            "Downscaling the video to keep the long edge at 1000px would result in dimensions "
-            f"below {MIN_DIMENSION}px: {new_width}x{new_height}. Refusing to process."
+            "Video frame does not satisfy Qwen3-VL's geometry / pixel-budget constraints:\n\n"
+            + "\n\n".join(errors)
         )
 
-    print(
-        "[video] Resizing frames before feeding them to Qwen3-VL:\n"
-        f"        original: {width}x{height}\n"
-        f"        resized:  {new_width}x{new_height}\n"
-        "        rationale: long edge capped at 1000px to align with the model's 1000×1000 "
-        "normalized bounding-box grid while preserving aspect ratio.",
-        flush=True,
-    )
-    return new_width, new_height
 
-
-def frame_to_base64_jpeg(frame_bgr: np.ndarray, target_w: int, target_h: int) -> str:
+def frame_to_base64_png(frame_bgr: np.ndarray) -> str:
     """
-    Resize frame (if needed) and encode as base64 JPEG for Qwen3-VL.
-    """
-    h, w = frame_bgr.shape[:2]
-    if (w, h) != (target_w, target_h):
-        frame_bgr = cv2.resize(frame_bgr, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    Encode a frame as base64 PNG for Qwen3-VL.
 
-    # JPEG encode; Qwen3-VL is robust to standard JPEG compression.
-    ok, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    We deliberately do NOT resize here. The frame is passed at the original
+    video resolution (subject to the unified Qwen3-VL lawyerly checks), and the
+    Qwen3-VL image processor inside Ollama is responsible for any dynamic
+    resizing / patch-aligned handling.
+
+    PNG is chosen to avoid introducing an extra layer of lossy JPEG compression
+    before Ollama decodes the image and applies Qwen's preprocessing. This keeps
+    the pixel content as faithful as possible to the decoded video frame.
+    """
+    if frame_bgr.dtype != np.uint8 or frame_bgr.ndim != 3 or frame_bgr.shape[2] != 3:
+        raise ValueError(
+            "frame_to_base64_png expects a uint8 BGR image with shape (height, width, 3). "
+            f"Got dtype={frame_bgr.dtype}, shape={frame_bgr.shape!r}."
+        )
+
+    ok, buf = cv2.imencode(".png", frame_bgr)
     if not ok:
-        raise RuntimeError("Failed to JPEG-encode frame for LLM input.")
+        raise RuntimeError("Failed to PNG-encode frame for LLM input.")
     return base64.b64encode(buf).decode("ascii")
 
 
@@ -687,16 +735,12 @@ def save_debug_frame_from_base64_image(image_b64: str, frame_index: int) -> None
 
     Behavior (opinionated, with no silent fallbacks):
     - Decode the base64 string that is fed into the LLM.
-    - First, attempt to write the raw bytes directly as a JPEG file to
-      ./workspace/frames/0000000001.jpg (and so on), where the number is
+    - Write the raw bytes directly as a PNG file to
+      ./workspace/frames/0000000001.png (and so on), where the number is
       the 1-based frame index in the original video, zero-padded to 10 digits.
       This preserves the exact compressed representation the LLM sees.
-    - If writing the JPEG file fails for any reason, decode the bytes into an
-      image and attempt to write a lossless PNG instead
-      ./workspace/frames/0000000001.png.
-    - If either base64 decoding, JPEG writing, or PNG writing fails, raise a
-      verbose RuntimeError describing what was supposed to happen and what
-      actually failed.
+    - If base64 decoding or PNG writing fails, raise a verbose RuntimeError
+      describing what was supposed to happen and what actually failed.
     """
     # Ensure the debug directory exists.
     try:
@@ -709,7 +753,6 @@ def save_debug_frame_from_base64_image(image_b64: str, frame_index: int) -> None
         ) from exc
 
     frame_number = frame_index + 1
-    jpeg_path = os.path.join(FRAMES_DEBUG_DIR, f"{frame_number:010d}.jpg")
     png_path = os.path.join(FRAMES_DEBUG_DIR, f"{frame_number:010d}.png")
 
     # Decode the base64 payload that is being sent to the LLM.
@@ -724,43 +767,19 @@ def save_debug_frame_from_base64_image(image_b64: str, frame_index: int) -> None
             f"{type(exc).__name__}: {exc}"
         ) from exc
 
-    # Primary attempt: persist the exact compressed representation as a JPEG file.
+    # Persist the exact compressed representation as a PNG file on disk.
     try:
-        with open(jpeg_path, "wb") as f:
+        with open(png_path, "wb") as f:
             f.write(img_bytes)
-        return
-    except Exception as exc_primary:
-        # Secondary attempt: preserve the pixel content losslessly as a PNG file.
-        try:
-            img_array = np.frombuffer(img_bytes, dtype=np.uint8)
-            img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-            if img is None:
-                raise RuntimeError(
-                    "cv2.imdecode returned None when attempting to decode the LLM image "
-                    f"bytes for frame_index={frame_index}. The bytes could not be interpreted "
-                    "as a valid image."
-                )
-            ok, png_buf = cv2.imencode(".png", img)
-            if not ok:
-                raise RuntimeError(
-                    "cv2.imencode('.png', ...) returned False when attempting to encode a "
-                    f"lossless debug PNG for frame_index={frame_index}."
-                )
-            with open(png_path, "wb") as f:
-                f.write(png_buf.tobytes())
-            return
-        except Exception as exc_secondary:
-            raise RuntimeError(
-                "Failed to persist a debug image file representing the exact content fed "
-                "into the LLM for a given frame.\n"
-                f"- Primary operation (writing raw JPEG bytes to {jpeg_path!r}) failed with "
-                f"{type(exc_primary).__name__}: {exc_primary}\n"
-                f"- Secondary operation (decoding those bytes and writing a PNG to "
-                f"{png_path!r}) also failed with {type(exc_secondary).__name__}: "
-                f"{exc_secondary}\n"
-                "As a result, no debug image file could be written for this frame. This "
-                "indicates an unexpected filesystem, OpenCV, or data integrity issue."
-            ) from exc_secondary
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to persist a debug PNG image file representing the exact content fed "
+            "into the LLM for a given frame.\n"
+            f"- Operation (writing raw PNG bytes to {png_path!r}) failed with "
+            f"{type(exc).__name__}: {exc}\n"
+            "As a result, no debug image file could be written for this frame. This "
+            "indicates an unexpected filesystem or data integrity issue."
+        ) from exc
 
 
 def strip_think_tags(text: str) -> str:
@@ -1097,8 +1116,6 @@ def run_llm_for_frame(
     duration: float,
     client,
     connection: OllamaConnectionConfig,
-    resized_w: int,
-    resized_h: int,
 ) -> List[NormalizedBBox]:
     """
     Run Qwen3-VL on a single frame, retrying until we get sane bounding boxes.
@@ -1140,10 +1157,38 @@ def run_llm_for_frame(
 
     while True:
         attempt += 1
-        b64_image = frame_to_base64_jpeg(frame_bgr, resized_w, resized_h)
+
+        # NOTE: This is the exact point where we hand off vision preprocessing to Ollama.
+        #
+        # We deliberately do NOT implement any Qwen3-VL-specific resizing, pixel-budget
+        # enforcement, or patch-aligned image handling here beyond the upfront checks in
+        # lawyerly_video_checks() (which run once per video resolution). Instead, we:
+        #
+        #   1. Encode the raw decoded video frame as a PNG (frame_to_base64_png),
+        #      preserving its original resolution as long as it satisfies Qwen3-VL's
+        #      H*W pixel budget and aspect-ratio constraints.
+        #   2. Send that base64 PNG to Ollama's qwen3-vl backend via the "images"
+        #      field in the chat message.
+        #
+        # On the Ollama side, the qwen3vl image processor is responsible for:
+        #   - Decoding the PNG bytes into a pixel tensor.
+        #   - Applying the same dynamic-resolution "SmartResize" logic used by the
+        #     official Qwen3-VL image processor, which:
+        #       * enforces the model's min/max pixel budget on the decoded tensor;
+        #       * ensures height/width are multiples of the internal patch size
+        #         (e.g. 16, with merging as configured);
+        #       * respects aspect ratio constraints.
+        #   - Normalizing and packing the image into the Qwen3-VL vision encoder.
+        #
+        # By validating that the frame lies within Qwen3-VL's allowed pixel budget
+        # and aspect-ratio regime before this call, and then passing the untouched
+        # frame pixels to Ollama, we align our inference-time preprocessing with the
+        # model's training-time assumptions without adding our own lossy downscaling
+        # or ad-hoc resizing layer.
+        b64_image = frame_to_base64_png(frame_bgr)
 
         # Persist a debug frame file constructed directly from the exact base64 payload
-        # that is about to be sent to the LLM. This ensures that the JPEG or PNG on disk
+        # that is about to be sent to the LLM. This ensures that the PNG on disk
         # faithfully represents what the model actually receives.
         save_debug_frame_from_base64_image(b64_image, frame_index)
 
@@ -1154,7 +1199,7 @@ def run_llm_for_frame(
             model=model_name,
             client=client,
             connection=connection,
-            max_completion_tokens=512,
+            max_completion_tokens=8192,
             please_no_thinking=False,
             require_json=False,  # thinking models cannot use strict JSON mode
         )
@@ -1384,8 +1429,14 @@ def process_video(
         flush=True,
     )
 
-    # Lawyerly checks + resize policy (may raise and abort early).
-    resized_w, resized_h = compute_frame_resize(orig_width, orig_height)
+    # Unified lawyerly checks + Qwen3-VL pixel budget validation (may raise and abort early).
+    lawyerly_video_checks(orig_width, orig_height)
+
+    print(
+        "[video] Frame resolution passes Qwen3-VL geometry & budget checks and will be "
+        "sent to Ollama without additional resizing.",
+        flush=True,
+    )
 
     frames_already_done = 0
     if os.path.exists(FRAMES_JSONL_PATH):
@@ -1455,8 +1506,6 @@ def process_video(
                                 duration=duration,
                                 client=client,
                                 connection=connection,
-                                resized_w=resized_w,
-                                resized_h=resized_h,
                             )
 
                             record = {

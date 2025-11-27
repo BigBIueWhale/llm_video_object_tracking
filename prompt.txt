@@ -1,1 +1,1 @@
-python3 bbox.py --description "We're driving a motorcycle down the highway (POV). Mark everything relevant from the list except for **our** motorcycle" --labels car,person,animal,motorcycle,bus,truck,van,bicycle,scooter,taxi,tractor,horse_carriage,ambulance,firetruck,traffic_light
+python3 bbox.py --description "We're driving a motorcycle down the highway (POV). Mark everything relevant from the list except for **our** motorcycle" --labels car,person,animal,motorcycle,bus,truck,van,bicycle,scooter,taxi,tractor,horse_carriage,ambulance,firetruck

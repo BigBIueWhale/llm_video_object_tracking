@@ -1134,7 +1134,7 @@ def run_llm_for_frame(
         )
 
     attempt = 0
-    model_name = "qwen3-vl:32b-thinking"
+    model_name = "qwen3-vl:32b-instruct"
 
     def _progress_prefix() -> str:
         """

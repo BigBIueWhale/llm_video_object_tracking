@@ -30,10 +30,13 @@ OUTPUT_VIDEO_PATH = "./workspace/output.mp4"
 FRAMES_JSONL_PATH = "./workspace/frames.jsonl"
 FRAMES_DEBUG_DIR = "./workspace/frames"
 
+# Model variant choice (centralized to avoid duplication)
+CURRENT_MODEL_NAME = "qwen3-vl:32b-instruct"
+
 # Qwen3-VL constraints / heuristics:
 # - Aspect ratio long/short must be <= 200 (per official docs).
 # - Width & height must be > 10 pixels.
-# - For grounding, the model uses a 1000x1000 normalized grid for bbox coordinates.
+# - For grounding, the model uses a normalized coordinate system scaled to [0, 1000].
 # - The Qwen3-VL image preprocessor's pixel budget for a single image (H x W) is:
 #     * min_pixels  = 65,536   (≈ 256 x 256)
 #     * max_pixels  = 16,777,216 (≈ 4096 x 4096)
@@ -44,7 +47,7 @@ FRAMES_DEBUG_DIR = "./workspace/frames"
 #   delegated to Ollama's Qwen3-VL image processor.
 MAX_ABS_ASPECT_RATIO = 200.0
 MIN_DIMENSION = 10
-QWEN_NORMALIZATION_GRID = 999.0  # coordinates are in [0, 999]
+QWEN_NORMALIZATION_GRID = 1000.0  # coordinates are in [0, 1000]
 
 QWEN3_VL_MIN_PIXELS = 65536        # 256 x 256, from Qwen3-VL preprocessor_config shortest_edge
 QWEN3_VL_MAX_PIXELS = 16777216     # 4096 x 4096, from Qwen3-VL preprocessor_config longest_edge
@@ -67,7 +70,7 @@ LABEL_COLOR_PALETTE_BGR: List[Tuple[int, int, int]] = [
 @dataclass
 class NormalizedBBox:
     """
-    Bounding box in Qwen3-VL's 1000×1000 normalized coordinate space.
+    Bounding box in Qwen3-VL's normalized coordinate space.
     """
     label: str
     x1: int
@@ -525,7 +528,7 @@ class FFmpegEncodeStream:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Offline object tracking with Qwen3-VL-32B-Thinking on ./workspace/input.mp4.\n"
+            "Offline object tracking with Qwen3-VL on ./workspace/input.mp4.\n"
             "Configurable inputs are: --description (what to look for) and "
             "--label/--labels (the finite set of labels the model must choose from)."
         )
@@ -849,7 +852,7 @@ def parse_bboxes_from_text(
     - Each entry is an object with:
         - 'bbox_2d' (preferred) or 'bbox' : list of 4 numbers [x1, y1, x2, y2]
         - 'label' (preferred) or 'category'/'text' : non-empty string
-    - Each coordinate must be a finite number in [0, 999].
+    - Each coordinate must be a finite number in [0, 1000].
     - Coordinates are coerced to ints; must satisfy x1 < x2 and y1 < y2.
     - If allowed_labels is provided, each 'label' must match (case-insensitive) one of them.
     """
@@ -912,9 +915,9 @@ def parse_bboxes_from_text(
                 raise ValueError(
                     f"Entry {idx} coordinate {j} is not finite: {f!r}"
                 )
-            if not (0.0 <= f <= 999.0):
+            if not (0.0 <= f <= 1000.0):
                 raise ValueError(
-                    f"Entry {idx} coordinate {j} is out of [0, 999] range: {f!r}"
+                    f"Entry {idx} coordinate {j} is out of [0, 1000] range: {f!r}"
                 )
             coords_f.append(f)
 
@@ -998,7 +1001,7 @@ def draw_bboxes_on_frame(
     color_text = (255, 255, 255)
 
     for box in bboxes:
-        # Map from [0, 999] grid to pixel coordinates.
+        # Map from [0, 1000] grid to pixel coordinates.
         x1 = int(round((box.x1 / QWEN_NORMALIZATION_GRID) * (width - 1)))
         y1 = int(round((box.y1 / QWEN_NORMALIZATION_GRID) * (height - 1)))
         x2 = int(round((box.x2 / QWEN_NORMALIZATION_GRID) * (width - 1)))
@@ -1078,7 +1081,7 @@ def build_llm_messages(
         f"{labels_block}\n\n"
         "Rules:\n"
         "- Coordinates are normalized on a 1000x1000 grid.\n"
-        "- Each coordinate is an integer in [0, 999].\n"
+        "- Each coordinate is an integer in [0, 1000].\n"
         "- x1 < x2 and y1 < y2.\n"
         "- For each detected object, the 'label' field must be EXACTLY one of the valid\n"
         "  labels listed above (match the spelling as closely as possible).\n"
@@ -1134,7 +1137,7 @@ def run_llm_for_frame(
         )
 
     attempt = 0
-    model_name = "qwen3-vl:32b-instruct"
+    model_name = CURRENT_MODEL_NAME
 
     def _progress_prefix() -> str:
         """
@@ -1358,10 +1361,10 @@ def parse_jsonl_line_to_bboxes(
         y2_i = item["y2"]
 
         for coord_name, value in (("x1", x1_i), ("y1", y1_i), ("x2", x2_i), ("y2", y2_i)):
-            if not (0 <= value <= 999):
+            if not (0 <= value <= 1000):
                 raise ValueError(
                     f"JSONL line {line_number} 'boxes[{idx}].{coord_name}'={value} "
-                    "is out of [0, 999] range."
+                    "is out of [0, 1000] range."
                 )
 
         if not (x1_i < x2_i and y1_i < y2_i):

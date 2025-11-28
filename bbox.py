@@ -31,7 +31,7 @@ FRAMES_JSONL_PATH = "./workspace/frames.jsonl"
 FRAMES_DEBUG_DIR = "./workspace/frames"
 
 # Model variant choice (centralized to avoid duplication)
-CURRENT_MODEL_NAME = "qwen3-vl:32b-instruct"
+CURRENT_MODEL_NAME = "qwen3-vl:32b-thinking"
 
 # Qwen3-VL constraints / heuristics:
 # - Aspect ratio long/short must be <= 200 (per official docs).
